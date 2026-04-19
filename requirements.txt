@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+celery
+redis
+langgraph
+langchain
+langchain-openai
+langchain-anthropic
+supabase
+python-jose
+passlib
+python-dotenv
+pydantic
+pydantic-settings
+httpx
+PyGithub
+python-multipart
