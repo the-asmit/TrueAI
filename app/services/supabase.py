@@ -112,8 +112,8 @@ def get_user_by_api_key(raw_api_key: str) -> Optional[str]:
         client = get_supabase()
         response = (
             client.table(_T_API_KEYS)
-            .select("user_id, is_active")
-            .eq("key_hash", hashed)
+            .select("user_id")
+            .eq("api_key", hashed)
             .single()
             .execute()
         )
@@ -121,10 +121,6 @@ def get_user_by_api_key(raw_api_key: str) -> Optional[str]:
         row: Optional[Dict[str, Any]] = response.data
         if not row:
             logger.debug("API key lookup: no matching key found.")
-            return None
-
-        if not row.get("is_active", True):
-            logger.info("API key lookup: key exists but is revoked.")
             return None
 
         user_id: str = row["user_id"]
@@ -364,7 +360,7 @@ def get_github_token(user_id: str) -> Optional[str]:
         client = get_supabase()
         response = (
             client.table(_T_GITHUB_TOKENS)
-            .select("access_token, is_active")
+            .select("access_token")
             .eq("user_id", user_id)
             .order("created_at", desc=True)
             .limit(1)
@@ -379,12 +375,6 @@ def get_github_token(user_id: str) -> Optional[str]:
             return None
 
         row = rows[0]
-        if not row.get("is_active", True):
-            logger.info(
-                "get_github_token: token for user_id=%s is inactive.", user_id
-            )
-            return None
-
         token: str = row["access_token"]
         logger.debug(
             "get_github_token: token retrieved for user_id=%s (prefix=%s...).",

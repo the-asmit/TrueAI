@@ -25,6 +25,7 @@ Task design principles
 
 from __future__ import annotations
 
+import asyncio
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -91,7 +92,7 @@ def process_incident(self: Task, payload: Dict[str, Any], user_id: str) -> Dict[
 
     logger.info(
         "process_incident START | task_id=%s | user_id=%s | event_id=%s | "
-        "attempt=%d/%d",
+        "attempt=%s/%s",
         task_id,
         user_id,
         event_id,
@@ -124,7 +125,7 @@ def process_incident(self: Task, payload: Dict[str, Any], user_id: str) -> Dict[
         # process actually executes a task.
         from app.pipelines.incident_pipeline import run_incident_pipeline
 
-        final_state = run_incident_pipeline(payload=payload, user_id=user_id)
+        final_state = asyncio.run(run_incident_pipeline(payload=payload, user_id=user_id))
 
         # ---- Success path --------------------------------------------- #
         incident_id: Optional[str] = (final_state or {}).get("incident_id")
