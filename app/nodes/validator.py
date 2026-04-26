@@ -24,6 +24,7 @@ Parsing rules (strictly enforced per project spec):
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, Dict, List
 
@@ -104,6 +105,41 @@ async def validator_node(state: IncidentState) -> IncidentState:
         state["validation_passed"] = validation_passed
         if updated_confidence is not None:
             state["confidence"] = updated_confidence
+
+        # ---- Persist fix to DB when validation passes ---------------- #
+        if validation_passed:
+            try:
+                from app.services.supabase import create_fix
+
+                fix_record = await asyncio.to_thread(
+                    create_fix,
+                    {
+                        "incident_id": state.get("incident_id"),
+                        "root_cause": state.get("root_cause"),
+                        "explanation": state.get("explanation"),
+                        "fix_diff": state.get("fix_diff"),
+                        "confidence": state.get("confidence"),
+                        "status": "pending",
+                    },
+                )
+                if fix_record:
+                    state["fix_id"] = fix_record["id"]
+                    logger.debug(
+                        "validator_node: fix persisted | incident_id=%s | fix_id=%s",
+                        incident_id,
+                        fix_record["id"],
+                    )
+                else:
+                    logger.warning(
+                        "validator_node: failed to persist fix to DB | incident_id=%s",
+                        incident_id,
+                    )
+            except Exception as persist_exc:
+                logger.error(
+                    "validator_node: error persisting fix | incident_id=%s | error=%s",
+                    incident_id,
+                    persist_exc,
+                )
 
         logger.debug(
             "validator_node EXIT | incident_id=%s | validation_passed=%s | "

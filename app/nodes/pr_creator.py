@@ -205,6 +205,17 @@ async def pr_creator_node(state: IncidentState) -> IncidentState:
         if not pr_url or not pr_number:
             state["error"] = "Failed to create GitHub pull request."
             state["status"] = "failed"
+            # Update fix status to failed
+            try:
+                from app.services.supabase import update_fix as _update_fix
+                _fix_id = state.get("fix_id")
+                if _fix_id:
+                    await asyncio.to_thread(_update_fix, str(_fix_id), {"status": "failed"})
+            except Exception as _fe:
+                logger.warning(
+                    "pr_creator_node: could not update fix status=failed | "
+                    "incident_id=%s | error=%s", incident_id, _fe
+                )
             return state
 
         # ---- Persist PR record to Supabase -------------------------- #
@@ -222,6 +233,18 @@ async def pr_creator_node(state: IncidentState) -> IncidentState:
         state["pr_url"] = pr_url
         state["pr_number"] = pr_number
         state["status"] = "pr_created"
+
+        # Update fix status to applied
+        try:
+            from app.services.supabase import update_fix as _update_fix
+            _fix_id = state.get("fix_id")
+            if _fix_id:
+                await asyncio.to_thread(_update_fix, str(_fix_id), {"status": "applied"})
+        except Exception as _fe:
+            logger.warning(
+                "pr_creator_node: could not update fix status=applied | "
+                "incident_id=%s | error=%s", incident_id, _fe
+            )
 
         logger.info(
             "pr_creator_node EXIT | incident_id=%s | pr_url=%s | pr_number=%d | "
@@ -244,6 +267,17 @@ async def pr_creator_node(state: IncidentState) -> IncidentState:
             exc,
             exc_info=True,
         )
+        # Update fix status to failed
+        try:
+            from app.services.supabase import update_fix as _update_fix
+            _fix_id = state.get("fix_id")
+            if _fix_id:
+                await asyncio.to_thread(_update_fix, str(_fix_id), {"status": "failed"})
+        except Exception as _fe:
+            logger.warning(
+                "pr_creator_node: could not update fix status=failed (exception path) | "
+                "incident_id=%s | error=%s", incident_id, _fe
+            )
         return state
 
 
@@ -262,7 +296,7 @@ async def _get_github_info(
             client = get_supabase()
             return (
                 client.table("github_tokens")
-                .select("access_token, repo_name, is_active")
+                .select("access_token, repo_name")
                 .eq("user_id", user_id)
                 .order("created_at", desc=True)
                 .limit(1)
@@ -272,7 +306,7 @@ async def _get_github_info(
         response = await asyncio.to_thread(_query)
         rows = response.data or []
 
-        if not rows or not rows[0].get("is_active", True):
+        if not rows:
             return None, None, _DEFAULT_BASE_BRANCH
 
         row = rows[0]
@@ -578,19 +612,15 @@ async def _persist_pr_record(
     try:
         from app.services.supabase import create_pull_request as supabase_create_pr
 
-        fix_id = state.get("fix_id")   # set by the fix persistence step upstream
+        fix_id = state.get("fix_id")   # set by validator_node after fix persisted
 
         pr_data: Dict[str, Any] = {
-            "incident_id": str(state.get("incident_id")),
+            "fix_id": str(fix_id) if fix_id else None,
             "pr_url": pr_url,
             "pr_number": pr_number,
             "branch_name": branch_name,
-            "repo_full_name": repo_full_name,
-            "title": pr_title,
-            "merged": False,
+            "status": "open",
         }
-        if fix_id:
-            pr_data["fix_id"] = str(fix_id)
 
         await asyncio.to_thread(supabase_create_pr, pr_data)
         logger.debug(

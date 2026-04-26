@@ -45,6 +45,7 @@ from typing import Any, Dict, Optional
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel
 
 from app.api.dependencies import require_current_user
 from app.auth.api_keys import generate_api_key, mask_key_for_logging
@@ -54,6 +55,10 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+
+class RepoSelectRequest(BaseModel):
+    repo_name: str
 
 _GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 _GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
@@ -95,9 +100,8 @@ async def create_api_key(
             .table("api_keys")
             .insert({
                 "user_id": user_id,
-                "key_hash": hashed_key,
-                "key_prefix": raw_key[:10],   # for display in UI
-                "is_active": True,
+                "api_key": hashed_key,
+                "key_prefix": raw_key[:12],
             })
             .execute()
         )
@@ -136,6 +140,134 @@ async def create_api_key(
         ),
     }
 
+# ================================================================== #
+# GitHub repo selection                                                #
+# ================================================================== #
+
+@router.post(
+    "/github/repo",
+    summary="Set the GitHub repository for incident auto-fix PRs",
+)
+async def set_github_repo(
+    body: RepoSelectRequest,
+    user_id: str = Depends(require_current_user),
+) -> Dict[str, Any]:
+    """
+    Store (or update) the GitHub repo that TrueAI will target when
+    opening automated fix pull requests.
+
+    The repo_name must be in the form ``owner/repo``.
+    """
+    repo_name = body.repo_name.strip()
+
+    # ---- Validate format ----------------------------------------- #
+    parts = repo_name.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="repo_name must be in the form 'owner/repo' with both sides non-empty.",
+        )
+
+    # ---- Ensure GitHub is connected ------------------------------ #
+    try:
+        from app.services.supabase import get_github_token, store_github_token
+        from app.services.supabase import get_supabase
+
+        # Fetch current token row so we can preserve existing_token + username
+        client = get_supabase()
+        gh_response = (
+            client.table("github_tokens")
+            .select("access_token, github_username")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = gh_response.data or []
+    except Exception as exc:
+        logger.error("set_github_repo: DB error | user_id=%s | error=%s", user_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch GitHub connection status.",
+        )
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Connect GitHub first via GET /auth/github/authorize.",
+        )
+
+    existing_token: str = rows[0]["access_token"]
+    existing_username: str = rows[0].get("github_username", "")
+
+    # ---- Upsert token row with repo_name ------------------------- #
+    try:
+        store_github_token({
+            "user_id": user_id,
+            "access_token": existing_token,
+            "github_username": existing_username,
+            "repo_name": repo_name,
+        })
+    except Exception as exc:
+        logger.error("set_github_repo: upsert error | user_id=%s | error=%s", user_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save repository selection.",
+        )
+
+    logger.info("set_github_repo: repo set | user_id=%s | repo=%s", user_id, repo_name)
+    return {"status": "ok", "repo_name": repo_name}
+
+
+# ================================================================== #
+# Webhook URL helper                                                   #
+# ================================================================== #
+
+@router.get(
+    "/user/webhook-url",
+    summary="Get your personalised Sentry webhook URL",
+)
+async def get_webhook_url(
+    user_id: str = Depends(require_current_user),
+) -> Dict[str, Any]:
+    """
+    Return a ready-to-use Sentry webhook URL containing the user's
+    API key prefix.  The full key is never exposed — only the prefix
+    stored in the DB at key-creation time.
+    """
+    try:
+        from app.services.supabase import get_supabase
+
+        response = (
+            get_supabase()
+            .table("api_keys")
+            .select("key_prefix")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = response.data or []
+    except Exception as exc:
+        logger.error("get_webhook_url: DB error | user_id=%s | error=%s", user_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch API key.",
+        )
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No API key found. Generate one via POST /auth/api-keys first.",
+        )
+
+    key_prefix: str = rows[0].get("key_prefix", "")
+    webhook_url = f"{settings.BASE_URL}/webhook/sentry?key={key_prefix}..."
+
+    return {
+        "webhook_url": webhook_url,
+        "key_prefix": key_prefix,
+    }
 
 @router.delete(
     "/api-keys/{key_id}",
@@ -159,8 +291,8 @@ async def revoke_api_key(
             get_supabase()
             .table("api_keys")
             .update({"is_active": False})
-            .eq("id", key_id)
-            .eq("user_id", user_id)   # ownership check
+            .eq("api_key", key_id)
+            .eq("user_id", user_id)
             .execute()
         )
         rows = response.data or []
@@ -294,11 +426,7 @@ async def github_callback(
         store_github_token({
             "user_id": user_id,
             "access_token": access_token,
-            "token_type": "bearer",
-            "scope": token_scope,
             "github_username": github_username,
-            "github_user_id": github_user_id,
-            "is_active": True,
         })
     except Exception as exc:
         logger.error(
@@ -346,7 +474,6 @@ async def get_me(
             .table("github_tokens")
             .select("github_username, repo_name, created_at")
             .eq("user_id", user_id)
-            .eq("is_active", True)
             .order("created_at", desc=True)
             .limit(1)
             .execute()

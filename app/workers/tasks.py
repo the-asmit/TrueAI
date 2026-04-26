@@ -133,7 +133,7 @@ def process_incident(self: Task, payload: Dict[str, Any], user_id: str) -> Dict[
 
         logger.info(
             "process_incident SUCCESS | task_id=%s | user_id=%s | event_id=%s | "
-            "incident_id=%s | pipeline_status=%s | attempt=%d/%d",
+            "incident_id=%s | pipeline_status=%s | attempt=%s/%s",
             task_id,
             user_id,
             event_id,
@@ -254,7 +254,7 @@ def _schedule_retry_or_give_up(
 
     logger.info(
         "process_incident RETRY_SCHEDULED | task_id=%s | user_id=%s | "
-        "event_id=%s | retry=%d/%d | countdown=%ds",
+        "event_id=%s | retry=%s/%s | countdown=%ds",
         task_id,
         user_id,
         event_id,
@@ -319,7 +319,7 @@ def _handle_task_failure(
 
     logger.error(
         "process_incident %s | task_id=%s | user_id=%s | event_id=%s | "
-        "attempt=%d/%d | error_type=%s | error=%s\n%s",
+        "attempt=%s/%s | error_type=%s | error=%s\n%s",
         label,
         task_id,
         user_id,
@@ -369,10 +369,7 @@ def _try_mark_incident_failed(
 
         update_incident(
             incident_id=incident_id,
-            update_data={
-                "status": "failed",
-                "pipeline_error": error_message[:2048],  # guard against huge tracebacks
-            },
+            update_data={"status": "failed"},
         )
         logger.debug(
             "_try_mark_incident_failed: incident_id=%s marked as failed | task_id=%s.",

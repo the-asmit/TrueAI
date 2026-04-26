@@ -77,7 +77,7 @@ async def run_incident_pipeline(
         or "unknown"
     )
 
-    start: float = time.time()
+    start_time: float = time.time()
 
     logger.info(
         "Pipeline START | incident_id=%s | user_id=%s | event_id=%s",
@@ -93,6 +93,47 @@ async def run_incident_pipeline(
         raw_payload=payload,
     )
 
+    # Insert the incident row into DB first, then update to "processing".
+    # Both steps are isolated — a DB failure must not abort the pipeline.
+    try:
+        import asyncio as _asyncio
+        from app.services.supabase import create_incident as _create_incident
+        from app.services.supabase import update_incident as _update_incident
+
+        _incident_data = {
+            "id": incident_id,
+            "user_id": user_id,
+            "sentry_event_id": event_id,
+            "error_type": (
+                payload.get("exception", {})
+                .get("values", [{}])[0]
+                .get("type", "unknown")
+            ),
+            "error_message": (
+                payload.get("exception", {})
+                .get("values", [{}])[0]
+                .get("value", "unknown")
+            ),
+            "stack_trace": payload.get("exception", {}),
+            "environment": payload.get("environment", "unknown"),
+            "status": "pending",
+        }
+
+        _created = await _asyncio.to_thread(_create_incident, _incident_data)
+        if _created:
+            await _asyncio.to_thread(_update_incident, incident_id, {"status": "processing"})
+        else:
+            logger.warning(
+                "Pipeline: create_incident returned None — skipping status update | "
+                "incident_id=%s",
+                incident_id,
+            )
+    except Exception as _exc:
+        logger.warning(
+            "Pipeline: could not insert/update incident row | incident_id=%s | error=%s",
+            incident_id, _exc,
+        )
+
     # ---- Execute graph ------------------------------------------- #
     try:
         # Lazy import to avoid a circular dependency at module load time:
@@ -105,20 +146,30 @@ async def run_incident_pipeline(
 
         final_state: Dict[str, Any] = await incident_graph.ainvoke(initial_state)
 
-        duration: float = time.time() - start
+        duration: float = time.time() - start_time
         status: str = final_state.get("status") or "unknown"
         action: str = final_state.get("action") or "none"
 
         logger.info(
-            "Pipeline COMPLETE | incident_id=%s | user_id=%s | event_id=%s | "
-            "status=%s | action=%s | duration=%.3fs",
-            incident_id,
-            user_id,
-            event_id,
-            status,
-            action,
-            duration,
+            f"Pipeline COMPLETE | incident_id={incident_id} | status={status} | action={action} | duration={duration:.3f}s"
         )
+
+        # ---- Update incident status based on pipeline action ---- #
+        try:
+            import asyncio as _asyncio
+            from app.services.supabase import update_incident as _update_incident
+            if action == "create_pr":
+                _db_status = "resolved"
+            elif action == "flag_for_review":
+                _db_status = "flagged"
+            else:
+                _db_status = status   # pass through whatever pipeline set
+            await _asyncio.to_thread(_update_incident, incident_id, {"status": _db_status})
+        except Exception as _exc:
+            logger.warning(
+                "Pipeline: could not update incident status | incident_id=%s | error=%s",
+                incident_id, _exc,
+            )
 
         # Ensure the return value is always a plain dict, not a TypedDict
         # subclass or LangGraph internal wrapper type.
@@ -126,7 +177,7 @@ async def run_incident_pipeline(
 
     # ---- Unhandled graph exception -------------------------------- #
     except Exception as exc:
-        duration = time.time() - start
+        duration = time.time() - start_time
 
         logger.error(
             "Pipeline FAILED (unhandled exception) | incident_id=%s | "
@@ -138,8 +189,19 @@ async def run_incident_pipeline(
             duration,
             type(exc).__name__,
             exc,
-            exc_info=True,   # attach full traceback to the log record
+            exc_info=True,
         )
+
+        # Update incident status to failed in DB.
+        try:
+            import asyncio as _asyncio
+            from app.services.supabase import update_incident as _update_incident
+            await _asyncio.to_thread(_update_incident, incident_id, {"status": "failed"})
+        except Exception as _db_exc:
+            logger.warning(
+                "Pipeline: could not set status=failed | incident_id=%s | error=%s",
+                incident_id, _db_exc,
+            )
 
         # Return a minimal failure state.  The Celery task checks for
         # incident_id before attempting a Supabase status update, so we

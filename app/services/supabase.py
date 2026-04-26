@@ -112,7 +112,7 @@ def get_user_by_api_key(raw_api_key: str) -> Optional[str]:
         client = get_supabase()
         response = (
             client.table(_T_API_KEYS)
-            .select("user_id")
+            .select("user_id, is_active")
             .eq("api_key", hashed)
             .single()
             .execute()
@@ -124,6 +124,9 @@ def get_user_by_api_key(raw_api_key: str) -> Optional[str]:
             return None
 
         user_id: str = row["user_id"]
+        if row.get("is_active") is False:
+            logger.info("API key is revoked.")
+            return None
         logger.debug("API key lookup: resolved to user_id=%s.", user_id)
         return user_id
 
@@ -286,6 +289,62 @@ def create_fix(fix_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             type(exc).__name__,
             exc,
             fix_data.get("incident_id"),
+        )
+        return None
+
+
+def update_fix(
+    fix_id: str,
+    update_data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Update an existing fix row by its UUID primary key.
+
+    Args:
+        fix_id: UUID string of the fix to update.
+        update_data: Column-value dict of fields to change.
+
+    Returns:
+        The updated row as a dict, or ``None`` on failure.
+    """
+    if not update_data:
+        logger.warning(
+            "update_fix called with empty update_data for id=%s — no-op.",
+            fix_id,
+        )
+        return None
+
+    try:
+        client = get_supabase()
+        response = (
+            client.table(_T_FIXES)
+            .update(update_data)
+            .eq("id", fix_id)
+            .execute()
+        )
+
+        rows: List[Dict[str, Any]] = response.data or []
+        if not rows:
+            logger.error(
+                "update_fix: update returned empty data for id=%s.",
+                fix_id,
+            )
+            return None
+
+        updated = rows[0]
+        logger.debug(
+            "update_fix: updated fix id=%s, fields=%s.",
+            fix_id,
+            list(update_data.keys()),
+        )
+        return updated
+
+    except Exception as exc:
+        logger.error(
+            "DB error in update_fix (id=%s): %s — %s.",
+            fix_id,
+            type(exc).__name__,
+            exc,
         )
         return None
 

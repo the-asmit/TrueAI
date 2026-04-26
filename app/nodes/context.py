@@ -174,7 +174,7 @@ async def _get_github_credentials(
             client = get_supabase()
             response = (
                 client.table("github_tokens")
-                .select("access_token, repo_name, is_active")
+                .select("access_token, repo_name")
                 .eq("user_id", user_id)
                 .order("created_at", desc=True)
                 .limit(1)
@@ -188,12 +188,6 @@ async def _get_github_credentials(
             return None, None
 
         row = rows[0]
-        if not row.get("is_active", True):
-            logger.warning(
-                "context_node: GitHub token for user_id=%s is inactive.", user_id
-            )
-            return None, None
-
         return row.get("access_token"), row.get("repo_name")
 
     except Exception as exc:
