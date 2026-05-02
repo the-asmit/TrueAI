@@ -132,6 +132,7 @@ class IncidentState(TypedDict, total=False):
 
     # ---- Stage 6: Validation ----------------------------------------- #
     validation_passed: bool
+    fix_id: str          # DB UUID of the persisted fix row; set by validator_node
 
     # ---- Stage 7: Decision ------------------------------------------- #
     action: str

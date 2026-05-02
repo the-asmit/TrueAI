@@ -431,10 +431,8 @@ def _try_mark_incident_failed(
     Update the incident's status to ``failed`` in Supabase.
 
     When *include_failure_reason* is True (used only on final retry
-    exhaustion) the ``failure_reason`` column is included in the update
-    payload.  If that column does not exist in the schema the Supabase
-    client will raise an error, which is caught and logged here without
-    masking the original pipeline exception.
+    exhaustion) the error message is also written to the ``error_message``
+    column so on-call engineers can diagnose the failure without grepping logs.
 
     Wrapped in its own try/except so that a secondary Supabase failure
     never masks the original pipeline exception or disrupts retry logic.
@@ -443,8 +441,7 @@ def _try_mark_incident_failed(
         incident_id:            UUID of the incident row to update.
         error_message:          Human-readable description of what went wrong.
         task_id:                Celery task UUID (for log context only).
-        include_failure_reason: If True, also set the ``failure_reason``
-                                column (requires the column to exist in the DB).
+        include_failure_reason: If True, also write the error_message column.
     """
     try:
         from app.services.supabase import update_incident
@@ -453,7 +450,9 @@ def _try_mark_incident_failed(
         if include_failure_reason:
             # Truncate to 1 000 characters to stay well within typical text
             # column limits; the full error is always available in worker logs.
-            update_data["failure_reason"] = error_message[:1_000]
+            # Note: writes to the existing `error_message` column — not a
+            # separate `failure_reason` column (which is not in the schema).
+            update_data["error_message"] = error_message[:1_000]
 
         update_incident(
             incident_id=incident_id,
@@ -468,13 +467,14 @@ def _try_mark_incident_failed(
         )
 
     except Exception as supabase_exc:
-        # Log at ERROR so this is visible, but do not re-raise ? the original
+        # Log at ERROR so this is visible, but do not re-raise — the original
         # pipeline exception takes priority.
         logger.error(
             "_try_mark_incident_failed: Supabase update failed for incident_id=%s | "
-            "task_id=%s | supabase_error=%s ? %s.",
+            "task_id=%s | supabase_error=%s — %s.",
             incident_id,
             task_id,
             type(supabase_exc).__name__,
             supabase_exc,
         )
+

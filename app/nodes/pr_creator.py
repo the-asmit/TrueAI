@@ -290,34 +290,39 @@ async def _get_github_info(
 ) -> Tuple[Optional[str], Optional[str], str]:
     """Return (access_token, repo_full_name, base_branch) from Supabase.
 
+    Uses ``get_github_token()`` (which decrypts Fernet ciphertext) for the
+    token so that plaintext credentials reach the GitHub API.  Querying the
+    raw ``access_token`` column directly would return encrypted bytes and
+    cause 401 failures on every GitHub call.
+
     The base_branch is resolved dynamically via the GitHub API so that repos
     using 'master' or any custom default branch work correctly.
     Falls back to 'main' only when credentials are unavailable or the API
     call fails (handled inside get_default_branch).
     """
     try:
-        from app.services.supabase import get_supabase
+        from app.services.supabase import get_github_token, get_supabase
 
-        def _query():
+        # Decrypted token via the service layer (handles Fernet ciphertext).
+        access_token: Optional[str] = await asyncio.to_thread(
+            get_github_token, user_id
+        )
+
+        # Separate query for repo_name (not sensitive, no decryption needed).
+        def _query_repo():
             client = get_supabase()
             return (
                 client.table("github_tokens")
-                .select("access_token, repo_name")
+                .select("repo_name")
                 .eq("user_id", user_id)
                 .order("created_at", desc=True)
                 .limit(1)
                 .execute()
             )
 
-        response = await asyncio.to_thread(_query)
+        response = await asyncio.to_thread(_query_repo)
         rows = response.data or []
-
-        if not rows:
-            return None, None, _FALLBACK_BASE_BRANCH
-
-        row = rows[0]
-        access_token: Optional[str] = row.get("access_token")
-        repo_full_name: Optional[str] = row.get("repo_name")
+        repo_full_name: Optional[str] = rows[0].get("repo_name") if rows else None
 
         # Resolve the actual default branch via the GitHub API.
         # get_default_branch never raises — falls back to 'main' on any error.
@@ -335,6 +340,7 @@ async def _get_github_info(
             exc,
         )
         return None, None, _FALLBACK_BASE_BRANCH
+
 
 
 # ------------------------------------------------------------------ #

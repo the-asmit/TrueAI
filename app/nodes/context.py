@@ -164,31 +164,36 @@ async def _get_github_credentials(
     """
     Return (access_token, repo_full_name) for *user_id* from Supabase.
 
-    Queries the github_tokens table directly to retrieve both the access
-    token and the associated default repository in a single round-trip.
+    Uses ``get_github_token()`` (which decrypts Fernet ciphertext) for the
+    token, and a separate Supabase query for the repo_name.  Querying the
+    raw ``access_token`` column directly would return the encrypted bytes
+    and cause GitHub API calls to fail with 401.
     """
     try:
-        from app.services.supabase import get_supabase
+        from app.services.supabase import get_github_token, get_supabase
 
-        def _query():
+        # Decrypted token via the service layer (handles Fernet ciphertext).
+        access_token: Optional[str] = await asyncio.to_thread(
+            get_github_token, user_id
+        )
+
+        # Separate query for repo_name (not sensitive, no decryption needed).
+        def _query_repo():
             client = get_supabase()
             response = (
                 client.table("github_tokens")
-                .select("access_token, repo_name")
+                .select("repo_name")
                 .eq("user_id", user_id)
                 .order("created_at", desc=True)
                 .limit(1)
                 .execute()
             )
-            return response.data or []
+            rows = response.data or []
+            return rows[0].get("repo_name") if rows else None
 
-        rows = await asyncio.to_thread(_query)
+        repo_full_name: Optional[str] = await asyncio.to_thread(_query_repo)
 
-        if not rows:
-            return None, None
-
-        row = rows[0]
-        return row.get("access_token"), row.get("repo_name")
+        return access_token, repo_full_name
 
     except Exception as exc:
         logger.error(
@@ -199,6 +204,7 @@ async def _get_github_credentials(
             exc,
         )
         return None, None
+
 
 
 # ------------------------------------------------------------------ #

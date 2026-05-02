@@ -93,12 +93,11 @@ async def run_incident_pipeline(
         raw_payload=payload,
     )
 
-    # Insert the incident row into DB first, then update to "processing".
-    # Both steps are isolated — a DB failure must not abort the pipeline.
+    # Insert the incident row into DB as "processing" in one step.
+    # This is isolated — a DB failure must not abort the pipeline.
     try:
         import asyncio as _asyncio
         from app.services.supabase import create_incident as _create_incident
-        from app.services.supabase import update_incident as _update_incident
 
         _incident_data = {
             "id": incident_id,
@@ -116,15 +115,13 @@ async def run_incident_pipeline(
             ),
             "stack_trace": payload.get("exception", {}),
             "environment": payload.get("environment", "unknown"),
-            "status": "pending",
+            "status": "processing",   # write final status directly; skip pending→processing round-trip
         }
 
         _created = await _asyncio.to_thread(_create_incident, _incident_data)
-        if _created:
-            await _asyncio.to_thread(_update_incident, incident_id, {"status": "processing"})
-        else:
+        if not _created:
             logger.warning(
-                "Pipeline: create_incident returned None — skipping status update | "
+                "Pipeline: create_incident returned None | "
                 "incident_id=%s",
                 incident_id,
             )
