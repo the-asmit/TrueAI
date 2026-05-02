@@ -12,11 +12,13 @@ Client App
     ▼
   Sentry (error captured)
     │
-    ▼ webhook (POST /webhook/sentry?key=<api_key_prefix>)
+    ▼ webhook (POST /webhook/sentry?key=<full_api_key>)
     │
   FastAPI
     │
-    ├─ Authenticates request via API key prefix
+    ├─ Verifies HMAC-SHA256 webhook signature (sentry-hook-signature header)
+    ├─ Authenticates request via API key lookup
+    ├─ Rate limits per API key (20 req/min by default)
     ├─ Enqueues job to Redis
     │
     ▼
@@ -25,15 +27,15 @@ Client App
     ▼
   LangGraph Pipeline
     │
-    ├─ parser_node       → normalise Sentry payload
-    ├─ dedup_node        → skip duplicate events (Redis SET NX)
-    ├─ classifier_node   → classify error type (Claude)
-    ├─ context_node      → fetch source files from GitHub
-    ├─ root_cause_node   → identify root cause (Claude)
+    ├─ parser_node        → normalise Sentry payload
+    ├─ dedup_node         → skip duplicate events (Redis SET NX)
+    ├─ classifier_node    → classify error type (Claude)
+    ├─ context_node       → fetch source files from GitHub
+    ├─ root_cause_node    → identify root cause (Claude)
     ├─ fix_generator_node → generate unified diff patch (Claude)
-    ├─ validator_node    → validate patch (Claude)
-    ├─ decision_node     → create_pr or flag_for_review
-    └─ pr_creator_node   → apply diff + open GitHub PR
+    ├─ validator_node     → validate patch (Claude)
+    ├─ decision_node      → create_pr or flag_for_review
+    └─ pr_creator_node    → apply diff + open GitHub PR
     │
     ▼
   GitHub Pull Request created
@@ -42,7 +44,7 @@ Client App
   Supabase (incident, fix, PR records persisted)
     │
     ▼
-  Dashboard (query incidents + PRs via REST API)
+  Dashboard (planned — frontend not yet implemented)
 ```
 
 ---
@@ -52,14 +54,16 @@ Client App
 | Component | Technology |
 |---|---|
 | API server | FastAPI (Python 3.11+) |
-| Task queue | Celery |
+| Task queue | Celery with exponential-backoff retry |
 | Broker / dedup cache | Redis |
 | AI orchestration | LangGraph |
-| LLM | Claude 3.5 Sonnet (Anthropic) |
+| LLM | Claude Sonnet (Anthropic) |
+| LLM resilience | Tenacity retry with exponential backoff (429/502/503) |
 | GitHub integration | PyGithub |
+| Token encryption | Fernet symmetric encryption (cryptography library) |
 | Database | Supabase (PostgreSQL) |
 | Schema validation | Pydantic v2 |
-| Auth | Supabase JWT + HMAC-signed API keys |
+| Auth | Supabase JWT + HMAC-signed API keys + Sentry webhook signature |
 
 ---
 
@@ -80,14 +84,14 @@ TrueAI/
 │   │   └── routes/
 │   │       ├── auth.py              # Auth routes: API keys, GitHub OAuth, repo selection
 │   │       ├── incidents.py         # Incident query routes
-│   │       └── webhook.py           # POST /webhook/sentry
+│   │       └── webhook.py           # POST /webhook/sentry (HMAC sig verify + rate limit)
 │   ├── auth/
 │   │   ├── api_keys.py              # HMAC-SHA256 key generation, hashing, masking
 │   │   └── jwt.py                   # Supabase JWT verification
 │   ├── core/
 │   │   ├── config.py                # Pydantic-settings config loader
 │   │   ├── graph.py                 # LangGraph pipeline graph definition
-│   │   ├── llm.py                   # Anthropic Claude client singleton
+│   │   ├── llm.py                   # Anthropic Claude client singleton + retry wrapper
 │   │   ├── logging.py               # Structured logger with sensitive data masking
 │   │   └── state.py                 # IncidentState TypedDict + make_initial_state
 │   ├── nodes/
@@ -108,15 +112,16 @@ TrueAI/
 │   │   ├── fix.py                   # Fix + PR Pydantic models + confidence thresholds
 │   │   └── github.py                # GitHub file context + PR request models
 │   ├── services/
+│   │   ├── crypto.py                # Fernet encrypt/decrypt for GitHub OAuth tokens
 │   │   ├── supabase.py              # Supabase client + all DB helper functions
 │   │   ├── redis.py                 # Redis client + dedup + cache helpers
 │   │   └── github/
-│   │       ├── client.py            # PyGithub wrappers
+│   │       ├── client.py            # PyGithub wrappers + dynamic default branch resolver
 │   │       ├── fetcher.py           # Fetch + slice source files from GitHub
 │   │       └── pr.py                # PR creation helpers
 │   └── workers/
 │       ├── celery_app.py            # Celery app initialisation
-│       └── tasks.py                 # Celery task: process_incident
+│       └── tasks.py                 # Celery task: process_incident (with retry policy)
 └── tests/
     ├── test_webhook.py
     ├── test_nodes.py
@@ -172,7 +177,7 @@ brew services start redis
 ### 6. Run the FastAPI server
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+uvicorn main:app --reload --port 8000
 ```
 
 ### 7. Run the Celery worker
@@ -201,6 +206,9 @@ Create a `.env` file at the project root with the following keys:
 | `CELERY_RESULT_BACKEND` | ✅ | Celery result backend URL, e.g. `redis://localhost:6379/1`. |
 | `GITHUB_CLIENT_ID` | ✅ | GitHub OAuth App client ID. Create an OAuth App in GitHub Developer Settings. |
 | `GITHUB_CLIENT_SECRET` | ✅ | GitHub OAuth App client secret. Never expose. |
+| `GITHUB_TOKEN_ENCRYPTION_KEY` | ✅ | Fernet symmetric key used to encrypt GitHub OAuth tokens at rest. Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `SENTRY_WEBHOOK_SECRET` | ⚠️ Optional | HMAC-SHA256 secret for verifying the `sentry-hook-signature` header on inbound webhooks. When absent, signature verification is skipped (fail-open). Strongly recommended in production. |
+| `RATE_LIMIT_PER_MINUTE` | ⚠️ Optional | Maximum webhook requests per API key per minute. Defaults to `20`. |
 
 **Example `.env`:**
 
@@ -221,7 +229,61 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/1
 
 GITHUB_CLIENT_ID=Iv1.abc123
 GITHUB_CLIENT_SECRET=abc123secret
+GITHUB_TOKEN_ENCRYPTION_KEY=<base64-fernet-key>
+
+SENTRY_WEBHOOK_SECRET=your-sentry-signing-secret
+RATE_LIMIT_PER_MINUTE=20
 ```
+
+---
+
+## Quick Test
+
+Once the server and worker are running, verify the pipeline end-to-end with a single `curl`:
+
+```bash
+curl -X POST "http://localhost:8000/webhook/sentry?key=<your_full_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "test-event-001",
+    "event_id": "test-event-001",
+    "project": "my-project",
+    "environment": "production",
+    "exception": {
+      "values": [
+        {
+          "type": "KeyError",
+          "value": "'user_id' not found in session",
+          "stacktrace": {
+            "frames": [
+              {
+                "filename": "app/views/dashboard.py",
+                "lineno": 42,
+                "function": "get_dashboard",
+                "in_app": true,
+                "context_line": "    user = session['user_id']"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }'
+```
+
+Expected response (`HTTP 202`):
+```json
+{ "status": "accepted", "incident_id": "<uuid>", "task_id": "<celery-task-uuid>" }
+```
+
+The Celery worker will then process the incident asynchronously. Query the result:
+
+```bash
+curl "http://localhost:8000/incidents/<incident_id>" \
+  -H "Authorization: Bearer <supabase_jwt>"
+```
+
+> **Note:** If `SENTRY_WEBHOOK_SECRET` is set, add the corresponding HMAC header. Without it, signature verification is skipped (fail-open).
 
 ---
 
@@ -234,7 +296,7 @@ GITHUB_CLIENT_SECRET=abc123secret
 | `POST` | `/auth/api-keys` | JWT | Generate a new API key. Raw key returned once only. |
 | `DELETE` | `/auth/api-keys/{key_id}` | JWT | Revoke an API key (soft-delete, sets `is_active=false`). |
 | `GET` | `/auth/github/authorize` | JWT | Start GitHub OAuth flow. Returns `auth_url` to redirect browser to. |
-| `GET` | `/auth/github/callback` | None (OAuth) | GitHub OAuth callback. Exchanges code for token, stores it, redirects to frontend. |
+| `GET` | `/auth/github/callback` | None (OAuth) | GitHub OAuth callback. Exchanges code for token, encrypts and stores it, redirects to frontend. |
 | `POST` | `/auth/github/repo` | JWT | Set the GitHub repository TrueAI will open PRs against. Body: `{"repo_name": "owner/repo"}`. |
 | `GET` | `/auth/user/webhook-url` | JWT | Returns the user's personalised Sentry webhook URL (uses key prefix, never full key). |
 | `GET` | `/auth/me` | JWT | Returns user info: `user_id`, `github_connected`, `github_username`, `github_repo`. |
@@ -243,7 +305,7 @@ GITHUB_CLIENT_SECRET=abc123secret
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/webhook/sentry` | API key (`?key=<prefix>`) | Sentry webhook entry point. Validates key, enqueues pipeline. |
+| `POST` | `/webhook/sentry` | API key (`?key=<full_api_key>`) + optional HMAC signature | Sentry webhook entry point. Verifies signature, validates key, enforces rate limit, enqueues pipeline. |
 
 ### Incidents
 
@@ -256,8 +318,10 @@ GITHUB_CLIENT_SECRET=abc123secret
 
 ## Pipeline — Step by Step
 
-1. **Webhook received** (`POST /webhook/sentry?key=<prefix>`)
-   - API key authenticated via prefix → full key hash looked up in `api_keys` table
+1. **Webhook received** (`POST /webhook/sentry?key=<full_api_key>`)
+   - HMAC-SHA256 signature verified against `sentry-hook-signature` header (if `SENTRY_WEBHOOK_SECRET` is set)
+   - API key authenticated via full key hash lookup in `api_keys` table
+   - Per-key rate limit enforced (default: 20 req/min)
    - Raw payload stored; Celery task enqueued
 
 2. **`parser_node`**
@@ -276,7 +340,7 @@ GITHUB_CLIENT_SECRET=abc123secret
    - Soft-fail: defaults to `code_bug` on any error
 
 5. **`context_node`**
-   - Fetches GitHub access token + repo from Supabase
+   - Fetches decrypted GitHub access token + repo from Supabase
    - For each in-app stack frame (up to 5 files): fetches source file via PyGithub
    - Extracts ±30-line window around the error line
    - Hard-fail only if ALL file fetches fail
@@ -304,6 +368,7 @@ GITHUB_CLIENT_SECRET=abc123secret
    - Otherwise → `action="flag_for_review"`
 
 10. **`pr_creator_node`**
+    - Resolves repository's actual default branch dynamically via GitHub API
     - Creates feature branch: `trueai/fix-{incident_id[:8]}`
     - Applies unified diff file-by-file using pure-Python hunk applier
     - Opens GitHub PR with structured Markdown body
@@ -314,6 +379,11 @@ GITHUB_CLIENT_SECRET=abc123secret
     - `action="create_pr"` → incident `status="resolved"`
     - `action="flag_for_review"` → incident `status="flagged"`
     - Unhandled exception → incident `status="failed"`
+
+12. **Celery retry policy**
+    - Transient failures (network errors, upstream 5xx) → auto-retry up to 3 times
+    - Backoff: 30 s → 60 s → 120 s (exponential: `30 × 2^n`)
+    - `status="failed"` or `status="duplicate"` → no retry (permanent states)
 
 ---
 
@@ -346,7 +416,7 @@ GITHUB_CLIENT_SECRET=abc123secret
 | `error_message` | text | |
 | `stack_trace` | jsonb | Raw Sentry exception object |
 | `environment` | text | e.g. `production`, `staging` |
-| `status` | text | `pending`, `processing`, `resolved`, `flagged`, `failed`, `duplicate` |
+| `status` | text | `processing`, `resolved`, `flagged`, `failed`, `duplicate` |
 | `created_at` | timestamptz | |
 
 ### `fixes`
@@ -366,7 +436,7 @@ GITHUB_CLIENT_SECRET=abc123secret
 |---|---|---|
 | `id` | uuid | PK |
 | `user_id` | uuid | FK → profiles.id, unique |
-| `access_token` | text | GitHub OAuth access token |
+| `access_token` | text | GitHub OAuth token, **Fernet-encrypted at rest** |
 | `github_username` | text | |
 | `repo_name` | text | `owner/repo` format |
 | `created_at` | timestamptz | |
@@ -379,7 +449,7 @@ GITHUB_CLIENT_SECRET=abc123secret
 | `pr_url` | text | Full GitHub PR URL |
 | `pr_number` | int | GitHub PR number |
 | `branch_name` | text | e.g. `trueai/fix-a1b2c3d4` |
-| `status` | text | `open`, `merged`, `closed` |
+| `status` | text | `open`, `merged`, `closed` — set to `open` on creation; merge/close tracking not yet implemented |
 | `created_at` | timestamptz | |
 
 ---
@@ -427,7 +497,7 @@ Response:
 { "auth_url": "https://github.com/login/oauth/authorize?..." }
 ```
 
-Redirect your browser to `auth_url`. After authorising, GitHub redirects back to TrueAI and the token is stored automatically.
+Redirect your browser to `auth_url`. After authorising, GitHub redirects back to TrueAI and the token is encrypted and stored automatically.
 
 ### Step 4 — Set your repository
 
@@ -459,7 +529,8 @@ Response:
 1. Go to your Sentry project → **Settings → Integrations → Webhooks**
 2. Add the `webhook_url` from Step 5
 3. Select events: **Issue Created** (and optionally **Issue Resolved**)
-4. Save
+4. *(Recommended)* Set a **Signing Secret** in Sentry and add it to TrueAI as `SENTRY_WEBHOOK_SECRET`
+5. Save
 
 TrueAI will now receive every new error from your Sentry project and attempt to auto-fix it.
 
@@ -467,26 +538,17 @@ TrueAI will now receive every new error from your Sentry project and attempt to 
 
 ## Current Limitations
 
-- **No branch configuration** — base branch is hardcoded to `main`. Repos using `master` or another default branch will fail PR creation.
 - **Single repo per user** — each GitHub account can only target one repository at a time. Multi-repo support requires schema changes.
 - **No PR merge tracking** — `pull_requests.status` is set to `open` and never updated. Merge webhooks from GitHub are not implemented.
-- **No rate limit handling for Anthropic** — if the Claude API returns 429, the pipeline fails. No retry logic with backoff is implemented at the LLM layer.
-- **Stack trace column is raw JSON** — `incidents.stack_trace` stores the raw Sentry exception object. Full-text search or structured queries require additional indexing.
-- **Celery task retry not configured** — failed pipeline tasks are not automatically retried. Manual re-triggering requires a new webhook event from Sentry.
-- **No webhook signature verification** — Sentry supports sending a `sentry-hook-signature` header. TrueAI does not currently verify it (relies on API key auth only).
 - **No multitenancy isolation at DB layer** — Row Level Security (RLS) is bypassed via the service-role key. API-layer isolation is enforced, but a misconfigured route could leak data.
 
 ---
 
 ## Future Improvements
 
-- [ ] **Branch configuration** — allow users to set a default base branch per repo
 - [ ] **Multi-repo support** — store multiple repos per user; route incidents to the correct repo by project/DSN
 - [ ] **GitHub webhook for PR merge tracking** — update `pull_requests.status` when PRs are merged or closed
-- [ ] **Anthropic retry with exponential backoff** — handle 429/503 from Claude gracefully
-- [ ] **Sentry webhook signature verification** — validate `sentry-hook-signature` on every inbound request
 - [ ] **RLS enforcement** — move tenant isolation into Supabase RLS policies and use the anon key for row-scoped queries
-- [ ] **Celery retry policy** — auto-retry transient failures (network errors, rate limits) with configurable backoff
 - [ ] **Dashboard UI** — React frontend for viewing incidents, fixes, PR status, and confidence scores
 - [ ] **Slack / PagerDuty notifications** — alert on `status="flagged"` incidents that need human review
 - [ ] **Confidence calibration** — collect feedback on merged vs. closed PRs to fine-tune confidence thresholds

@@ -31,10 +31,9 @@ Task design principles
    In both cases the task returns the final_state immediately without
    scheduling a retry.
 
-6. ``failure_reason`` is included in the final Supabase update when all
-   retries are exhausted.  If the column does not exist in the schema the
-   update will fail; ``_try_mark_incident_failed`` catches that error and
-   logs it without masking the original exception.
+6. On final retry exhaustion the ``error_message`` column is updated with a
+   truncated description of the failure so on-call engineers can diagnose
+   the root cause without grepping worker logs.
 """
 
 from __future__ import annotations
