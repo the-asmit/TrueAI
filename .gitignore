@@ -1,9 +1,53 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
 venv/
 myenv/
+.venv/
+env/
+
+# Environment variables
 .env
-*.egg-info/
-.DS_Store
+.env.*
+
+# Logs
 logs/*.log
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Graphify
+graphify-out/
+graph.json
+graph.html
+GRAPH_REPORT.md
+.agents
+.graphifyignore
+
+# Redis dump
+dump.rdb
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/

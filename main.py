@@ -29,6 +29,9 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.routes.auth import router as auth_router
 from app.api.routes.incidents import router as incidents_router
@@ -106,6 +109,11 @@ async def lifespan(app: FastAPI):
 # Application factory                                                  #
 # ================================================================== #
 
+def _webhook_key_func(request: Request) -> str:
+    """Rate-limiter bucket: full API key from ?key= query param, or 'anonymous'."""
+    return request.query_params.get("key") or "anonymous"
+
+
 app = FastAPI(
     title="TrueAI",
     description=(
@@ -121,6 +129,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Attach the rate limiter to app.state so SlowAPIMiddleware can discover it.
+app.state.limiter = Limiter(key_func=_webhook_key_func)
+
 
 # ================================================================== #
 # Middleware                                                           #
@@ -133,6 +144,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# SlowAPI middleware reads app.state.limiter to enforce rate limits.
+app.add_middleware(SlowAPIMiddleware)
 
 
 @app.middleware("http")
@@ -167,6 +181,17 @@ async def request_id_middleware(request: Request, call_next):
 # ================================================================== #
 # Exception handlers                                                   #
 # ================================================================== #
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_exceeded_handler(
+    request: Request, exc: RateLimitExceeded
+) -> JSONResponse:
+    """Return HTTP 429 with a structured body when a rate limit is exceeded."""
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": "rate limit exceeded"},
+    )
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(

@@ -89,6 +89,21 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------ #
+    # Webhooks & Rate Limiting                                             #
+    # ------------------------------------------------------------------ #
+    SENTRY_WEBHOOK_SECRET: str | None = Field(
+        default=None,
+        description=(
+            "HMAC-SHA256 secret used to verify sentry-hook-signature headers. "
+            "When absent, signature verification is skipped (fail-open)."
+        ),
+    )
+    RATE_LIMIT_PER_MINUTE: int = Field(
+        default=20,
+        description="Maximum webhook requests allowed per API key per minute.",
+    )
+
+    # ------------------------------------------------------------------ #
     # Validators                                                           #
     # ------------------------------------------------------------------ #
 

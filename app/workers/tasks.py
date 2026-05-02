@@ -2,14 +2,14 @@
 Celery task definitions for TrueAI's async incident processing pipeline.
 
 Task design principles
-──────────────────────
+----------------------
 1. Idempotency is ensured upstream by the Redis deduplication gate in the
    webhook route.  The task itself is not idempotent; do not call it twice
    for the same event without first removing the dedup key.
 
 2. Exponential backoff is implemented explicitly:
-       countdown = 60 × (2 ^ self.request.retries)
-   giving retry delays of 60 s → 120 s → 240 s.  This is intentional and
+       countdown = 30 ? (2 ^ self.request.retries)
+   giving retry delays of 30 s ? 60 s ? 120 s.  This is intentional and
    must not be replaced by Celery's ``task_default_retry_delay``, which
    applies a fixed interval.
 
@@ -19,8 +19,22 @@ Task design principles
 
 4. Supabase is updated to ``status="failed"`` only when the pipeline state
    contains an ``incident_id``.  If the pipeline crashed before the DB row
-   was created, there is nothing to update and we skip silently — never
+   was created, there is nothing to update and we skip silently ? never
    blindly attempt an update with a missing or fabricated ID.
+
+5. Non-retriable terminal states:
+   - ``status="failed"`` returned by the pipeline signals a permanent LLM
+     logic error (bad request, auth failure, etc.).  Retrying cannot help
+     and would waste quota.
+   - ``status="duplicate"`` means the dedup gate already processed this
+     event; retrying would create a duplicate incident row.
+   In both cases the task returns the final_state immediately without
+   scheduling a retry.
+
+6. ``failure_reason`` is included in the final Supabase update when all
+   retries are exhausted.  If the column does not exist in the schema the
+   update will fail; ``_try_mark_incident_failed`` catches that error and
+   logs it without masking the original exception.
 """
 
 from __future__ import annotations
@@ -41,6 +55,10 @@ logger = get_logger(__name__)
 # Maximum number of retry attempts (must match celery_app.conf.task_max_retries
 # so both the task decorator and the app-level default are consistent).
 _MAX_RETRIES: int = 3
+
+# Pipeline status values that indicate a permanent (non-transient) failure;
+# retrying these would waste quota and potentially create duplicate records.
+_NON_RETRIABLE_STATUSES: frozenset[str] = frozenset({"failed", "duplicate"})
 
 
 # ------------------------------------------------------------------ #
@@ -66,7 +84,7 @@ def process_incident(self: Task, payload: Dict[str, Any], user_id: str) -> Dict[
     Args:
         payload:  Raw Sentry webhook payload dict as received from the webhook
                   route (already validated by :class:`~app.schemas.webhook.SentryWebhookPayload`).
-        user_id:  TrueAI workspace user identifier — used for scoping
+        user_id:  TrueAI workspace user identifier ? used for scoping
                   GitHub token lookups and Supabase row ownership.
 
     Returns:
@@ -127,10 +145,34 @@ def process_incident(self: Task, payload: Dict[str, Any], user_id: str) -> Dict[
 
         final_state = asyncio.run(run_incident_pipeline(payload=payload, user_id=user_id))
 
-        # ---- Success path --------------------------------------------- #
-        incident_id: Optional[str] = (final_state or {}).get("incident_id")
+        # ---- Non-retriable terminal states check ---------------------- #
+        # The pipeline contract (see incident_pipeline.py) guarantees it
+        # never raises ? it returns a dict with status="failed" when a
+        # permanent LLM error occurs.  We must inspect the returned status
+        # before deciding whether to retry, because blindly retrying a
+        # bad-request or auth error burns quota without any hope of success.
         pipeline_status: str = (final_state or {}).get("status", "unknown")
+        incident_id: Optional[str] = (final_state or {}).get("incident_id")
 
+        if pipeline_status in _NON_RETRIABLE_STATUSES:
+            logger.warning(
+                "process_incident NON_RETRIABLE | task_id=%s | user_id=%s | "
+                "event_id=%s | incident_id=%s | pipeline_status=%s | "
+                "attempt=%s/%s ? returning without retry.",
+                task_id,
+                user_id,
+                event_id,
+                incident_id or "n/a",
+                pipeline_status,
+                attempt,
+                max_attempts,
+            )
+            # Return the state as-is; Celery marks the task SUCCESS (which is
+            # accurate ? the task ran to completion; the pipeline determined
+            # no fix was possible).
+            return final_state or {}
+
+        # ---- Success path --------------------------------------------- #
         logger.info(
             "process_incident SUCCESS | task_id=%s | user_id=%s | event_id=%s | "
             "incident_id=%s | pipeline_status=%s | attempt=%s/%s",
@@ -156,7 +198,7 @@ def process_incident(self: Task, payload: Dict[str, Any], user_id: str) -> Dict[
             attempt=attempt,
             max_attempts=max_attempts,
             final_state=final_state,
-            include_traceback=False,  # no traceback — it's a signal, not a bug
+            include_traceback=False,  # no traceback ? it's a signal, not a bug
         )
         _schedule_retry_or_give_up(
             self=self,
@@ -164,6 +206,7 @@ def process_incident(self: Task, payload: Dict[str, Any], user_id: str) -> Dict[
             task_id=task_id,
             user_id=user_id,
             event_id=event_id,
+            final_state=final_state,
         )
 
     # ---- All other failures ------------------------------------------- #
@@ -185,6 +228,7 @@ def process_incident(self: Task, payload: Dict[str, Any], user_id: str) -> Dict[
             task_id=task_id,
             user_id=user_id,
             event_id=event_id,
+            final_state=final_state,
         )
 
 
@@ -227,6 +271,7 @@ def _schedule_retry_or_give_up(
     task_id: str,
     user_id: str,
     event_id: str,
+    final_state: Optional[Dict[str, Any]],
 ) -> None:
     """
     Attempt to schedule a retry with true exponential backoff, or raise
@@ -234,23 +279,28 @@ def _schedule_retry_or_give_up(
     are consumed.
 
     Backoff schedule:
-        Attempt 1 fails → retry in  60 s  (60 × 2⁰)
-        Attempt 2 fails → retry in 120 s  (60 × 2¹)
-        Attempt 3 fails → retry in 240 s  (60 × 2²)
-        Attempt 4 fails → MaxRetriesExceededError (task marked FAILURE)
+        Attempt 1 fails ? retry in  30 s  (30 ? 2?)
+        Attempt 2 fails ? retry in  60 s  (30 ? 2?)
+        Attempt 3 fails ? retry in 120 s  (30 ? 2?)
+        Attempt 4 fails ? MaxRetriesExceededError (task marked FAILURE)
+
+    On MaxRetriesExceededError the incident row is updated to
+    ``status="failed"`` with a ``failure_reason`` if the column exists.
 
     Args:
-        self:      Bound Celery task instance.
-        exc:       The exception that caused the failure.
-        task_id:   Task UUID for structured log context.
-        user_id:   Workspace user identifier for structured log context.
-        event_id:  Sentry event ID for structured log context.
+        self:        Bound Celery task instance.
+        exc:         The exception that caused the failure.
+        task_id:     Task UUID for structured log context.
+        user_id:     Workspace user identifier for structured log context.
+        event_id:    Sentry event ID for structured log context.
+        final_state: Pipeline state dict if available (used to extract
+                     ``incident_id`` for the final Supabase update).
 
     Raises:
-        :class:`celery.exceptions.Retry`               — if a retry was scheduled.
-        :class:`celery.exceptions.MaxRetriesExceededError` — after last attempt.
+        :class:`celery.exceptions.Retry`               ? if a retry was scheduled.
+        :class:`celery.exceptions.MaxRetriesExceededError` ? after last attempt.
     """
-    countdown: int = 60 * (2 ** self.request.retries)
+    countdown: int = 30 * (2 ** self.request.retries)
 
     logger.info(
         "process_incident RETRY_SCHEDULED | task_id=%s | user_id=%s | "
@@ -278,6 +328,28 @@ def _schedule_retry_or_give_up(
             event_id,
             _MAX_RETRIES,
         )
+
+        # On exhaustion, persist a failure_reason so on-call engineers can
+        # diagnose why the task gave up without trawling worker logs.
+        incident_id: Optional[str] = (final_state or {}).get("incident_id")
+        if incident_id:
+            failure_reason: str = (
+                f"Task exhausted {_MAX_RETRIES} retries. "
+                f"Last error: {type(exc).__name__}: {exc}"
+            )
+            _try_mark_incident_failed(
+                incident_id=incident_id,
+                error_message=failure_reason,
+                task_id=task_id,
+                include_failure_reason=True,
+            )
+        else:
+            logger.debug(
+                "process_incident MAX_RETRIES_EXCEEDED | task_id=%s | "
+                "skipping Supabase update ? no incident_id in pipeline state.",
+                task_id,
+            )
+
         # Re-raise so Celery marks the task as FAILURE in the result backend.
         raise
 
@@ -298,7 +370,7 @@ def _handle_task_failure(
 
     Supabase is only written to when ``final_state`` contains a non-empty
     ``incident_id``.  This guards against a race where the pipeline crashed
-    before the DB row was created — attempting an update with a missing ID
+    before the DB row was created ? attempting an update with a missing ID
     would silently update zero rows or, worse, match an unrelated row.
 
     Args:
@@ -331,17 +403,18 @@ def _handle_task_failure(
         tb,
     )
 
-    # Update the incident row if — and only if — we know its ID.
+    # Update the incident row if ? and only if ? we know its ID.
     incident_id: Optional[str] = (final_state or {}).get("incident_id")
     if incident_id:
         _try_mark_incident_failed(
             incident_id=incident_id,
             error_message=f"{type(exc).__name__}: {exc}",
             task_id=task_id,
+            include_failure_reason=False,  # intermediate attempts: status only
         )
     else:
         logger.debug(
-            "process_incident %s | task_id=%s | skipping Supabase update — "
+            "process_incident %s | task_id=%s | skipping Supabase update ? "
             "no incident_id in pipeline state.",
             label,
             task_id,
@@ -352,37 +425,54 @@ def _try_mark_incident_failed(
     incident_id: str,
     error_message: str,
     task_id: str,
+    include_failure_reason: bool = False,
 ) -> None:
     """
     Update the incident's status to ``failed`` in Supabase.
+
+    When *include_failure_reason* is True (used only on final retry
+    exhaustion) the ``failure_reason`` column is included in the update
+    payload.  If that column does not exist in the schema the Supabase
+    client will raise an error, which is caught and logged here without
+    masking the original pipeline exception.
 
     Wrapped in its own try/except so that a secondary Supabase failure
     never masks the original pipeline exception or disrupts retry logic.
 
     Args:
-        incident_id:   UUID of the incident row to update.
-        error_message: Human-readable description of what went wrong.
-        task_id:       Celery task UUID (for log context only).
+        incident_id:            UUID of the incident row to update.
+        error_message:          Human-readable description of what went wrong.
+        task_id:                Celery task UUID (for log context only).
+        include_failure_reason: If True, also set the ``failure_reason``
+                                column (requires the column to exist in the DB).
     """
     try:
         from app.services.supabase import update_incident
 
+        update_data: Dict[str, Any] = {"status": "failed"}
+        if include_failure_reason:
+            # Truncate to 1 000 characters to stay well within typical text
+            # column limits; the full error is always available in worker logs.
+            update_data["failure_reason"] = error_message[:1_000]
+
         update_incident(
             incident_id=incident_id,
-            update_data={"status": "failed"},
+            update_data=update_data,
         )
         logger.debug(
-            "_try_mark_incident_failed: incident_id=%s marked as failed | task_id=%s.",
+            "_try_mark_incident_failed: incident_id=%s marked as failed "
+            "(include_failure_reason=%s) | task_id=%s.",
             incident_id,
+            include_failure_reason,
             task_id,
         )
 
     except Exception as supabase_exc:
-        # Log at ERROR so this is visible, but do not re-raise — the original
+        # Log at ERROR so this is visible, but do not re-raise ? the original
         # pipeline exception takes priority.
         logger.error(
             "_try_mark_incident_failed: Supabase update failed for incident_id=%s | "
-            "task_id=%s | supabase_error=%s — %s.",
+            "task_id=%s | supabase_error=%s ? %s.",
             incident_id,
             task_id,
             type(supabase_exc).__name__,

@@ -11,17 +11,27 @@ The get_webhook_user dependency hashes the key and looks it up in Supabase.
 
 Sentry signature verification
 ──────────────────────────────
-When SENTRY_CLIENT_SECRET is configured, the endpoint verifies the
+When SENTRY_WEBHOOK_SECRET is configured, the endpoint verifies the
 sentry-hook-signature header (HMAC-SHA256 of the raw body keyed on the
-client secret) before processing the payload.  This prevents replay attacks
-and spoofed webhooks.  Verification is skipped gracefully when the header
-or secret is absent so that development environments work without setup.
+webhook secret) before processing the payload.  This prevents replay attacks
+and spoofed webhooks.  Verification is skipped gracefully (with a WARNING
+log) when the secret is not configured, so development environments work
+without additional setup.
+
+If the signature header is present but does not match → HTTP 401.
+If the header is absent and no secret is configured → request proceeds.
+
+Rate limiting
+─────────────
+Each API key (?key=) is rate-limited to RATE_LIMIT_PER_MINUTE requests per
+minute via slowapi.  Anonymous callers (no key) share a single "anonymous"
+bucket.  Exceeded limits return HTTP 429.
 
 Processing flow
 ───────────────
-1. Authenticate request (API key).
+1. Authenticate request (API key → user_id).
 2. Optionally verify Sentry signature.
-3. Parse body against SentryWebhookPayload schema (defensive).
+3. Parse raw body against SentryWebhookPayload schema (defensive).
 4. Dispatch Celery task asynchronously — return 202 immediately.
    The webhook handler must not block waiting for analysis to finish.
 5. Log the dispatch with request_id and event_id for end-to-end tracing.
@@ -43,14 +53,39 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from app.api.dependencies import get_webhook_user
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.schemas.webhook import SentryWebhookPayload
 
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+
+# ================================================================== #
+# Rate-limiter key — full API key from query param                    #
+# ================================================================== #
+
+def _webhook_key_func(request: Request) -> str:
+    """
+    Derive the rate-limiter bucket from the ?key= query parameter.
+
+    Uses the full API key so each user has an independent quota.
+    Falls back to 'anonymous' when no key is supplied (those requests
+    will be rejected by the auth dependency anyway, but the limiter
+    still tracks them).
+    """
+    return request.query_params.get("key") or "anonymous"
+
+
+# Module-level limiter used by the @limiter.limit decorator below.
+# SlowAPIMiddleware (attached in main.py) reads app.state.limiter; this
+# local reference makes the decorator work without a circular import.
+limiter = Limiter(key_func=_webhook_key_func)
 
 
 # ================================================================== #
@@ -63,6 +98,7 @@ router = APIRouter()
     summary="Receive Sentry webhook",
     response_description="Event accepted for asynchronous processing.",
 )
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
 async def receive_sentry_webhook(
     request: Request,
     user_id: str = Depends(get_webhook_user),
@@ -80,19 +116,46 @@ async def receive_sentry_webhook(
     """
     request_id = getattr(request.state, "request_id", "unknown")
 
-    # ---- Read raw body (needed for signature verification) --------- #
+    # ---- Read raw body once (needed for HMAC verification) ---------- #
     raw_body: bytes = await request.body()
 
-    # ---- Optional Sentry signature verification -------------------- #
+    # ---- Sentry signature verification ----------------------------- #
     _verify_sentry_signature(
         raw_body=raw_body,
         signature_header=sentry_hook_signature,
         request_id=request_id,
     )
 
-    # ---- Parse payload --------------------------------------------- #
+    # ---- Parse payload from raw body ------------------------------- #
+    # We use model_validate_json on the raw bytes so we do NOT call
+    # request.json() separately (body stream already consumed above).
     try:
-        payload_dict: Dict[str, Any] = await request.json()
+        parsed: Optional[SentryWebhookPayload] = (
+            SentryWebhookPayload.model_validate_json(raw_body)
+        )
+        # Build a plain dict for downstream use (event_id lookup, Celery arg)
+        payload_dict: Dict[str, Any] = parsed.model_dump()
+    except ValidationError as exc:
+        logger.warning(
+            "Webhook: payload schema validation failed | request_id=%s | "
+            "errors=%s",
+            request_id,
+            exc.error_count(),
+        )
+        # Don't fail hard — Sentry payloads vary; parse permissively
+        import json as _json
+
+        try:
+            payload_dict = _json.loads(raw_body)
+        except Exception:
+            logger.warning(
+                "Webhook: invalid JSON body | request_id=%s", request_id
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Request body must be valid JSON.",
+            )
+        parsed = None
     except Exception:
         logger.warning(
             "Webhook: invalid JSON body | request_id=%s", request_id
@@ -101,20 +164,6 @@ async def receive_sentry_webhook(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Request body must be valid JSON.",
         )
-
-    # Validate against SentryWebhookPayload schema — uses model_validate
-    # which is tolerant (extra="allow") but ensures the structure is sane.
-    try:
-        parsed = SentryWebhookPayload.model_validate(payload_dict)
-    except ValidationError as exc:
-        logger.warning(
-            "Webhook: payload schema validation failed | request_id=%s | "
-            "errors=%s",
-            request_id,
-            exc.error_count(),
-        )
-        # Don't fail hard — Sentry payloads vary; log and still process
-        parsed = None
 
     event_id: str = (
         payload_dict.get("event_id")
@@ -190,43 +239,50 @@ def _verify_sentry_signature(
     request_id: str,
 ) -> None:
     """
-    Verify the sentry-hook-signature header when configured.
+    Verify the sentry-hook-signature header when SENTRY_WEBHOOK_SECRET is set.
 
-    Sentry signs the raw request body with HMAC-SHA256 using the
-    integration's client secret.  We use hmac.compare_digest for
-    constant-time comparison to prevent timing attacks.
+    Sentry signs the raw request body with HMAC-SHA256 using the webhook
+    secret configured in the integration settings.  We use
+    hmac.compare_digest for constant-time comparison to prevent timing
+    attacks.
 
-    Skips verification (with a DEBUG log) when:
-    - The signature header is absent (Sentry didn't send one, or it's
-      a dev environment).
-    - GITHUB_CLIENT_SECRET is not configured as a Sentry secret
-      (TrueAI uses SENTRY_CLIENT_SECRET for this; falls back gracefully).
+    Behaviour matrix:
+    ┌─────────────────────────┬──────────────────────┬─────────────┐
+    │ SENTRY_WEBHOOK_SECRET   │ sentry-hook-signature│ Result      │
+    ├─────────────────────────┼──────────────────────┼─────────────┤
+    │ not set                 │ any / absent         │ skip (warn) │
+    │ set                     │ absent               │ HTTP 401    │
+    │ set                     │ present, matches     │ OK          │
+    │ set                     │ present, mismatch    │ HTTP 401    │
+    └─────────────────────────┴──────────────────────┴─────────────┘
 
     Raises:
-        HTTPException(400) when a signature IS present but does not match.
+        HTTPException(401) when verification fails.
     """
-    if not signature_header:
-        logger.debug(
-            "Webhook: no sentry-hook-signature header | request_id=%s — "
-            "skipping verification",
+
+    secret: Optional[str] = settings.SENTRY_WEBHOOK_SECRET
+
+    if not secret:
+        # Fail-open: secret not configured → skip verification with a warning
+        logger.warning(
+            "Webhook: SENTRY_WEBHOOK_SECRET not configured | "
+            "request_id=%s — skipping signature verification",
             request_id,
         )
         return
 
-    try:
-        from app.core.config import settings
-        # We re-use GITHUB_CLIENT_SECRET as the Sentry webhook secret if a
-        # dedicated SENTRY_CLIENT_SECRET is not in settings.  In production,
-        # add SENTRY_CLIENT_SECRET to .env and settings.
-        secret = getattr(settings, "SENTRY_CLIENT_SECRET", None) or ""
-        if not secret:
-            logger.debug(
-                "Webhook: no SENTRY_CLIENT_SECRET configured | "
-                "request_id=%s — skipping signature verification",
-                request_id,
-            )
-            return
+    # Secret is set — now we enforce the header
+    if not signature_header:
+        logger.warning(
+            "Webhook: sentry-hook-signature header missing | request_id=%s",
+            request_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing webhook signature.",
+        )
 
+    try:
         expected = hmac.new(
             secret.encode("utf-8"),
             raw_body,
@@ -238,7 +294,7 @@ def _verify_sentry_signature(
                 "Webhook: signature mismatch | request_id=%s", request_id
             )
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Webhook signature verification failed.",
             )
 
@@ -250,10 +306,14 @@ def _verify_sentry_signature(
         raise
     except Exception as exc:
         logger.error(
-            "Webhook: error during signature verification | "
-            "request_id=%s | error=%s — allowing request",
+            "Webhook: unexpected error during signature verification | "
+            "request_id=%s | error=%s — rejecting request",
             request_id,
-            exc,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Webhook signature verification error.",
         )
 
 

@@ -15,3 +15,4 @@ pydantic-settings
 httpx
 PyGithub
 python-multipart
+slowapi

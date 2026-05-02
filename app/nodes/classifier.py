@@ -27,7 +27,7 @@ from typing import Final
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.core.llm import get_llm
+from app.core.llm import call_llm_with_retry, get_llm
 from app.core.logging import get_logger
 from app.core.state import IncidentState, ISSUE_CLASSIFICATIONS
 
@@ -62,9 +62,8 @@ async def classifier_node(state: IncidentState) -> IncidentState:
     try:
         prompt = _build_prompt(state)
         llm = get_llm()
-        response = await llm.ainvoke(
-            [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=prompt)]
-        )
+        messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=prompt)]
+        response = await call_llm_with_retry(llm.ainvoke, messages)
         response_text: str = response.content or ""
 
         classification = _parse_classification(response_text, incident_id)
