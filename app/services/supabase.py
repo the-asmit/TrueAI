@@ -26,6 +26,7 @@ from supabase import Client, create_client
 from app.auth.api_keys import hash_api_key
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.crypto import decrypt_token
 
 logger = get_logger(__name__)
 
@@ -434,7 +435,8 @@ def get_github_token(user_id: str) -> Optional[str]:
             return None
 
         row = rows[0]
-        token: str = row["access_token"]
+        encrypted: str = row["access_token"]
+        token: str = decrypt_token(encrypted)
         logger.debug(
             "get_github_token: token retrieved for user_id=%s (prefix=%s...).",
             user_id,

@@ -16,3 +16,4 @@ httpx
 PyGithub
 python-multipart
 slowapi
+cryptography

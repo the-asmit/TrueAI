@@ -35,12 +35,12 @@ from fastapi import HTTPException
 
 from app.core.logging import get_logger
 from app.core.state import IncidentState
-from app.services.github.client import get_github_client, create_branch
+from app.services.github.client import get_github_client, create_branch, get_default_branch
 
 logger = get_logger(__name__)
 
 _BRANCH_PREFIX: str = "trueai/fix-"
-_DEFAULT_BASE_BRANCH: str = "main"
+_FALLBACK_BASE_BRANCH: str = "main"  # used only when credentials are unavailable
 
 
 async def pr_creator_node(state: IncidentState) -> IncidentState:
@@ -288,7 +288,13 @@ async def pr_creator_node(state: IncidentState) -> IncidentState:
 async def _get_github_info(
     user_id: str,
 ) -> Tuple[Optional[str], Optional[str], str]:
-    """Return (access_token, repo_full_name, base_branch) from Supabase."""
+    """Return (access_token, repo_full_name, base_branch) from Supabase.
+
+    The base_branch is resolved dynamically via the GitHub API so that repos
+    using 'master' or any custom default branch work correctly.
+    Falls back to 'main' only when credentials are unavailable or the API
+    call fails (handled inside get_default_branch).
+    """
     try:
         from app.services.supabase import get_supabase
 
@@ -307,21 +313,28 @@ async def _get_github_info(
         rows = response.data or []
 
         if not rows:
-            return None, None, _DEFAULT_BASE_BRANCH
+            return None, None, _FALLBACK_BASE_BRANCH
 
         row = rows[0]
-        return (
-            row.get("access_token"),
-            row.get("repo_name"),
-            _DEFAULT_BASE_BRANCH,
-        )
+        access_token: Optional[str] = row.get("access_token")
+        repo_full_name: Optional[str] = row.get("repo_name")
+
+        # Resolve the actual default branch via the GitHub API.
+        # get_default_branch never raises — falls back to 'main' on any error.
+        if access_token and repo_full_name:
+            base_branch = await get_default_branch(access_token, repo_full_name)
+        else:
+            base_branch = _FALLBACK_BASE_BRANCH
+
+        return access_token, repo_full_name, base_branch
+
     except Exception as exc:
         logger.error(
             "pr_creator_node: error fetching GitHub info for user_id=%s: %s",
             user_id,
             exc,
         )
-        return None, None, _DEFAULT_BASE_BRANCH
+        return None, None, _FALLBACK_BASE_BRANCH
 
 
 # ------------------------------------------------------------------ #

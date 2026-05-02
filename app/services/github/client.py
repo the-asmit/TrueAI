@@ -23,6 +23,7 @@ first 4 characters of the username are logged where attribution is needed.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from fastapi import HTTPException, status
@@ -321,6 +322,43 @@ def validate_token(access_token: str) -> bool:
             exc,
         )
         return False
+
+
+# ------------------------------------------------------------------ #
+# Default branch resolver                                              #
+# ------------------------------------------------------------------ #
+
+async def get_default_branch(access_token: str, repo_full_name: str) -> str:
+    """
+    Return the default branch name for *repo_full_name* (e.g. ``"main"`` or
+    ``"master"`` or whatever the repo owner configured).
+
+    Uses ``asyncio.to_thread()`` because PyGithub is a synchronous library.
+
+    Args:
+        access_token:   GitHub OAuth / PAT token.  **Never logged.**
+        repo_full_name: Repository in ``"owner/repo"`` format.
+
+    Returns:
+        The default branch name string.  Falls back to ``"main"`` on any
+        error so that callers are never blocked by a lookup failure.
+    """
+    try:
+        def _fetch() -> str:
+            client = get_github_client(access_token)
+            repo = client.get_repo(repo_full_name)
+            return repo.default_branch
+
+        return await asyncio.to_thread(_fetch)
+
+    except Exception as exc:
+        logger.warning(
+            "get_default_branch: failed to resolve default branch for '%s' "
+            "(%s) — falling back to 'main'.",
+            repo_full_name,
+            type(exc).__name__,
+        )
+        return "main"
 
 
 # ------------------------------------------------------------------ #

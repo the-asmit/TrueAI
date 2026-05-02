@@ -104,6 +104,17 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------ #
+    # Token Encryption                                                     #
+    # ------------------------------------------------------------------ #
+    GITHUB_TOKEN_ENCRYPTION_KEY: str = Field(
+        description=(
+            "Fernet symmetric encryption key for GitHub OAuth access tokens. "
+            "Generate with: python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\""
+        ),
+    )
+
+    # ------------------------------------------------------------------ #
     # Validators                                                           #
     # ------------------------------------------------------------------ #
 

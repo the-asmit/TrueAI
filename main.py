@@ -85,6 +85,21 @@ async def lifespan(app: FastAPI):
         logger.error("Anthropic LLM client FAILED at startup: %s", exc)
         raise
 
+    # Fernet encryption key — validates GITHUB_TOKEN_ENCRYPTION_KEY format
+    try:
+        from cryptography.fernet import Fernet
+        Fernet(settings.GITHUB_TOKEN_ENCRYPTION_KEY.encode())
+        logger.info("Fernet token encryption key: OK")
+    except Exception as exc:
+        logger.error(
+            "GITHUB_TOKEN_ENCRYPTION_KEY validation FAILED at startup: %s", exc
+        )
+        raise RuntimeError(
+            "Invalid GITHUB_TOKEN_ENCRYPTION_KEY — must be a valid Fernet key. "
+            "Generate one with: python -c \""
+            "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        ) from exc
+
     logger.info("TrueAI startup complete — ready to serve requests.")
     yield
 

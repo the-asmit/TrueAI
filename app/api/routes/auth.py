@@ -51,6 +51,7 @@ from app.api.dependencies import require_current_user
 from app.auth.api_keys import generate_api_key, mask_key_for_logging
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.crypto import encrypt_token
 
 logger = get_logger(__name__)
 
@@ -425,7 +426,7 @@ async def github_callback(
 
         store_github_token({
             "user_id": user_id,
-            "access_token": access_token,
+            "access_token": encrypt_token(access_token),
             "github_username": github_username,
         })
     except Exception as exc:
