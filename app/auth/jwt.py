@@ -35,12 +35,23 @@ logger = get_logger(__name__)
 # Supabase exclusively uses HS256; accepting other algorithms opens the
 # door to algorithm-confusion attacks (e.g. RS256 with a public key as
 # the secret, or the "alg: none" bypass).
-_ALGORITHM: str = "HS256"
+_ALGORITHM: str = "ES256"
 
 # Supabase audience claim expected value.  Supabase sets aud="authenticated"
 # for all logged-in user tokens.  We verify this to ensure TrueAI does not
 # accept service-role tokens or anon tokens as user credentials.
 _EXPECTED_AUDIENCE: str = "authenticated"
+
+
+# Supabase ECC P-256 public key (JWK format)
+_SUPABASE_PUBLIC_JWK = {
+    "x": "_Y8PYL_C351JwEnSjVpPqY2fF1_kvdlXq8WVfUqVABA",
+    "y": "30iVSGkefQp7D6Q3fOmGP74LDIU-4zQqcsnIMj0ijBE",
+    "alg": "ES256",
+    "crv": "P-256",
+    "kty": "EC",
+    "kid": "9dbe1a07-1305-434f-9c13-41ab62a7ee66",
+}
 
 
 # ------------------------------------------------------------------ #
@@ -52,7 +63,7 @@ def verify_jwt(token: str) -> Dict[str, Any]:
     Decode and fully verify a Supabase-issued JWT.
 
     Performs:
-    - HMAC-SHA256 signature verification using ``SUPABASE_JWT_SECRET``
+    - ECDSA-SHA256 (ES256) signature verification using Supabase public JWK
     - Expiry (``exp``) validation
     - Audience (``aud``) validation — must be ``"authenticated"``
     - Presence and non-emptiness of the ``sub`` claim
@@ -75,7 +86,7 @@ def verify_jwt(token: str) -> Dict[str, Any]:
     try:
         payload: Dict[str, Any] = jwt.decode(
             token,
-            settings.SUPABASE_JWT_SECRET,
+            _SUPABASE_PUBLIC_JWK,  # ES256 public JWK — not a shared secret
             algorithms=[_ALGORITHM],
             audience=_EXPECTED_AUDIENCE,
             options={
