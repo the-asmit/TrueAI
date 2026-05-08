@@ -63,7 +63,7 @@ Client App
 | Token encryption | Fernet symmetric encryption (cryptography library) |
 | Database | Supabase (PostgreSQL) |
 | Schema validation | Pydantic v2 |
-| Auth | Supabase JWT + HMAC-signed API keys + Sentry webhook signature |
+| Auth | Supabase JWT (ES256 / ECDSA P-256) + HMAC-signed API keys + Sentry webhook HMAC-SHA256 signature |
 
 ---
 
@@ -87,7 +87,7 @@ TrueAI/
 │   │       └── webhook.py           # POST /webhook/sentry (HMAC sig verify + rate limit)
 │   ├── auth/
 │   │   ├── api_keys.py              # HMAC-SHA256 key generation, hashing, masking
-│   │   └── jwt.py                   # Supabase JWT verification
+│   │   └── jwt.py                   # Supabase JWT verification (ES256 / ECDSA P-256 via public JWK); rejects service_role tokens
 │   ├── core/
 │   │   ├── config.py                # Pydantic-settings config loader
 │   │   ├── graph.py                 # LangGraph pipeline graph definition
@@ -115,6 +115,7 @@ TrueAI/
 │   │   ├── crypto.py                # Fernet encrypt/decrypt for GitHub OAuth tokens
 │   │   ├── supabase.py              # Supabase client + all DB helper functions
 │   │   ├── redis.py                 # Redis client + dedup + cache helpers
+│   │   ├── sentry.py                # Sentry REST API client — fetches full event by event_id (parser fallback)
 │   │   └── github/
 │   │       ├── client.py            # PyGithub wrappers + dynamic default branch resolver
 │   │       ├── fetcher.py           # Fetch + slice source files from GitHub
@@ -164,7 +165,18 @@ cp .env.example .env
 
 See the [Environment Variables](#environment-variables) section below for a full description of every key.
 
-### 5. Run Redis locally
+### 5. Configure Supabase RLS
+
+The `incidents` table requires a service-role policy to allow server-side inserts. Run this in the **Supabase SQL Editor**:
+
+```sql
+CREATE POLICY "service_role_full_access_incidents" ON public.incidents
+FOR ALL TO service_role USING (true) WITH CHECK (true);
+```
+
+> **Note:** TrueAI uses the service-role key for all server-side DB operations. Without this policy, incident row inserts will be rejected by RLS and the pipeline will fail silently.
+
+### 6. Run Redis locally
 
 ```bash
 # Docker (recommended)
@@ -174,13 +186,13 @@ docker run -d -p 6379:6379 redis:7-alpine
 brew services start redis
 ```
 
-### 6. Run the FastAPI server
+### 7. Run the FastAPI server
 
 ```bash
 uvicorn main:app --reload --port 8000
 ```
 
-### 7. Run the Celery worker
+### 8. Run the Celery worker
 
 ```bash
 celery -A app.workers.tasks worker --loglevel=info
@@ -200,13 +212,15 @@ Create a `.env` file at the project root with the following keys:
 | `SUPABASE_URL` | ✅ | Your Supabase project URL, e.g. `https://xyzxyz.supabase.co`. |
 | `SUPABASE_ANON_KEY` | ✅ | Supabase anonymous/public key. Used for client-side auth flows. |
 | `SUPABASE_SERVICE_ROLE_KEY` | ✅ | Supabase service-role key. Bypasses RLS — used server-side only. Never expose to clients. |
-| `SUPABASE_JWT_SECRET` | ✅ | JWT secret from Supabase project settings. Used to verify Supabase-issued JWTs on authenticated routes. |
+| `SUPABASE_JWT_SECRET` | ✅ | JWT secret from Supabase project settings. Retained for legacy consumers; primary JWT verification now uses the Supabase ECC public JWK (ES256). |
 | `REDIS_URL` | ✅ | Redis connection URL, e.g. `redis://localhost:6379/0`. |
 | `CELERY_BROKER_URL` | ✅ | Celery broker URL (typically same as `REDIS_URL`), e.g. `redis://localhost:6379/0`. |
 | `CELERY_RESULT_BACKEND` | ✅ | Celery result backend URL, e.g. `redis://localhost:6379/1`. |
 | `GITHUB_CLIENT_ID` | ✅ | GitHub OAuth App client ID. Create an OAuth App in GitHub Developer Settings. |
 | `GITHUB_CLIENT_SECRET` | ✅ | GitHub OAuth App client secret. Never expose. |
 | `GITHUB_TOKEN_ENCRYPTION_KEY` | ✅ | Fernet symmetric key used to encrypt GitHub OAuth tokens at rest. Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `SENTRY_AUTH_TOKEN` | ⚠️ Optional | Sentry API auth token (from **Settings → Auth Tokens**). Required for the parser's Sentry API fallback — if the inbound webhook carries no exception frames, `sentry.py` uses this token to fetch the full event. Without it the fallback is silently skipped. |
+| `SENTRY_ORG_SLUG` | ⚠️ Optional | Sentry organisation slug (e.g. `my-org`). Used to construct the Sentry REST API URL for full-event fetches. Defaults to `trueai-94`. |
 | `SENTRY_WEBHOOK_SECRET` | ⚠️ Optional | HMAC-SHA256 secret for verifying the `sentry-hook-signature` header on inbound webhooks. When absent, signature verification is skipped (fail-open). Strongly recommended in production. |
 | `RATE_LIMIT_PER_MINUTE` | ⚠️ Optional | Maximum webhook requests per API key per minute. Defaults to `20`. |
 
@@ -231,6 +245,8 @@ GITHUB_CLIENT_ID=Iv1.abc123
 GITHUB_CLIENT_SECRET=abc123secret
 GITHUB_TOKEN_ENCRYPTION_KEY=<base64-fernet-key>
 
+SENTRY_AUTH_TOKEN=sntrys_...
+SENTRY_ORG_SLUG=my-org
 SENTRY_WEBHOOK_SECRET=your-sentry-signing-secret
 RATE_LIMIT_PER_MINUTE=20
 ```
@@ -327,7 +343,10 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 2. **`parser_node`**
    - Validates payload against `SentryWebhookPayload` Pydantic model
    - Extracts `error_type`, `error_message`, in-app stack frames, Sentry context
-   - Fails fast if no user-code frames found
+   - **Sentry API fallback:** if the webhook payload carries no exception frames, fetches the full event from the Sentry API by `event_id` + `project_slug` and retries parsing
+   - Falls back from in-app frames → all frames when Sentry's `in_app` flag is absent (path heuristic used instead)
+   - Builds `frame_contexts` dict keyed by `filename:lineno` for inline source context in the root-cause prompt
+   - Sets `status="processing"` on success; fails fast if still no frames after fallback
 
 3. **`dedup_node`**
    - Checks Redis for `event_id` using atomic `SET NX EX 86400`
@@ -340,10 +359,11 @@ curl "http://localhost:8000/incidents/<incident_id>" \
    - Soft-fail: defaults to `code_bug` on any error
 
 5. **`context_node`**
-   - Fetches decrypted GitHub access token + repo from Supabase
+   - Fetches decrypted GitHub access token (Fernet-encrypted at rest) + repo from Supabase
    - For each in-app stack frame (up to 5 files): fetches source file via PyGithub
-   - Extracts ±30-line window around the error line
-   - Hard-fail only if ALL file fetches fail
+   - Extracts ±30-line window around the error line, annotated with line numbers for precise LLM cross-referencing
+   - Each frame fetched independently — a single file failure never aborts the enrichment pass
+   - **Non-fatal all-fail:** if every frame fails, logs a WARNING and continues with empty `github_context` (does not set `status="failed"`)
 
 6. **`root_cause_node`**
    - Sends all evidence (frames, source code, Sentry context) to Claude
@@ -379,8 +399,14 @@ curl "http://localhost:8000/incidents/<incident_id>" \
     - `action="create_pr"` → incident `status="resolved"`
     - `action="flag_for_review"` → incident `status="flagged"`
     - Unhandled exception → incident `status="failed"`
+    - DB status is updated post-graph; DB failures are non-fatal (logged as WARNING, never crash the pipeline)
 
-12. **Celery retry policy**
+12. **Incident DB lifecycle**
+    - Row is inserted as `status="processing"` **before** the graph executes (so the incident is always visible even if the graph crashes)
+    - Post-graph: `create_pr` → `resolved`, `flag_for_review` → `flagged`, pipeline error → `failed`
+    - The returned failure dict always includes `incident_id` so the Celery task can attempt a final DB status update
+
+13. **Celery retry policy**
     - Transient failures (network errors, upstream 5xx) → auto-retry up to 3 times
     - Backoff: 30 s → 60 s → 120 s (exponential: `30 × 2^n`)
     - `status="failed"` or `status="duplicate"` → no retry (permanent states)
@@ -416,7 +442,9 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 | `error_message` | text | |
 | `stack_trace` | jsonb | Raw Sentry exception object |
 | `environment` | text | e.g. `production`, `staging` |
-| `status` | text | `processing`, `resolved`, `flagged`, `failed`, `duplicate` |
+| `status` | text | `pending` (inserted pre-pipeline), `processing`, `resolved`, `flagged`, `failed`, `duplicate` |
+| `issue_classification` | text | `code_bug`, `config_issue`, `infrastructure`, `data_issue`, `dependency`, `unknown` |
+| `pipeline_error` | text | Error message captured when the pipeline fails; NULL on success |
 | `created_at` | timestamptz | |
 
 ### `fixes`
@@ -526,11 +554,13 @@ Response:
 
 ### Step 6 — Add to Sentry
 
-1. Go to your Sentry project → **Settings → Integrations → Webhooks**
-2. Add the `webhook_url` from Step 5
-3. Select events: **Issue Created** (and optionally **Issue Resolved**)
-4. *(Recommended)* Set a **Signing Secret** in Sentry and add it to TrueAI as `SENTRY_WEBHOOK_SECRET`
-5. Save
+1. Go to your Sentry project → **Settings → Developer Settings → Webhooks**
+2. Click **Create Webhook**
+3. In **Name**, enter something like `TrueAI Auto-Fix`
+4. In **Webhook URL**, paste the `webhook_url` from Step 5
+5. In **Event Types**, select **Issue Created** (and optionally **Issue Resolved**)
+6. In **Signing Secret**, enter the value of your `SENTRY_WEBHOOK_SECRET` environment variable
+7. Click **Create**
 
 TrueAI will now receive every new error from your Sentry project and attempt to auto-fix it.
 
