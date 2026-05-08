@@ -278,11 +278,31 @@ async def get_incident_pr(
     try:
         from app.services.supabase import get_supabase
 
+        # First, find the latest fix for this incident
+        fix_response = (
+            get_supabase()
+            .table("fixes")
+            .select("id")
+            .eq("incident_id", str(incident_id))
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        fix_rows = fix_response.data or []
+        if not fix_rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No pull request found for incident {incident_id}.",
+            )
+            
+        fix_id = fix_rows[0]["id"]
+
+        # Now get the PR for that fix
         response = (
             get_supabase()
             .table("pull_requests")
             .select("*")
-            .eq("incident_id", str(incident_id))
+            .eq("fix_id", fix_id)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
