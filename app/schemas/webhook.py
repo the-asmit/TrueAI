@@ -307,7 +307,7 @@ class SentryWebhookPayload(BaseModel):
         default=None,
         description="SDK platform identifier (e.g. 'python', 'javascript').",
     )
-    release: Optional[str] = Field(
+    release: Optional[Union[str, Any]] = Field(
         default=None,
         description="Application release/version string.",
     )

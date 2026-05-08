@@ -91,6 +91,16 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Webhooks & Rate Limiting                                             #
     # ------------------------------------------------------------------ #
+
+    SENTRY_AUTH_TOKEN: Optional[str] = Field(
+        default=None,
+        description="Sentry API auth token for fetching full event details.",
+    )
+    SENTRY_ORG_SLUG: str = Field(
+        default="trueai-94",
+        description="Sentry organization slug.",
+    )
+
     SENTRY_WEBHOOK_SECRET: str | None = Field(
         default=None,
         description=(

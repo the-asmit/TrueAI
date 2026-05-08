@@ -69,12 +69,50 @@ async def parser_node(state: IncidentState) -> IncidentState:
             )
             return state
 
+        # ---- Fetch full event from Sentry API if no exception data ---- #
+        if not payload.get_stack_frames():
+            from app.services.sentry import fetch_sentry_event
+            event_id = (
+                raw_payload.get("event", {}).get("event_id")
+                or raw_payload.get("event_id")
+                or raw_payload.get("id")
+            )
+            project_slug = raw_payload.get("project_slug")
+            if event_id and project_slug:
+                logger.debug(
+                    "parser_node: no frames in webhook payload, fetching full event "
+                    "from Sentry API | incident_id=%s | event_id=%s",
+                    incident_id, event_id,
+                )
+                full_event = await fetch_sentry_event(project_slug, event_id)
+                if full_event:
+                    exception_data = full_event.get("entries", [])
+                    for entry in exception_data:
+                        if entry.get("type") == "exception":
+                            raw_payload = {**raw_payload, "exception": entry.get("data", {})}
+                            try:
+                                payload = SentryWebhookPayload.model_validate(raw_payload)
+                                logger.debug(
+                                    "parser_node: full event fetched successfully | "
+                                    "incident_id=%s | frames=%d",
+                                    incident_id, len(payload.get_stack_frames()),
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "parser_node: full event schema validation failed | "
+                                    "incident_id=%s | error=%s",
+                                    incident_id, e,
+                                )
+                            break
+
         # ---- Basic error fields --------------------------------------- #
         error_type: str = payload.get_error_type() or "UnknownError"
         error_message: str = payload.get_error_message() or ""
 
         # ---- User-code frames only ------------------------------------ #
         in_app_frames = payload.get_in_app_frames()
+        if not in_app_frames:
+            in_app_frames = payload.get_stack_frames()  # fallback to all frames
 
         if not in_app_frames:
             # No user-code frames means the crash is entirely in third-party

@@ -107,7 +107,7 @@ def _build_prompt(state: IncidentState) -> str:
         fname = frame.get("filename", "?")
         lineno = frame.get("lineno", "?")
         func = frame.get("function", "?")
-        ctx = frame.get("context_line", "").strip()
+        ctx = (frame.get("context_line") or "").strip()
         frame_summary_lines.append(f"  {fname}:{lineno} in {func}() → {ctx}")
     frame_summary = "\n".join(frame_summary_lines) or "  (no frames)"
 

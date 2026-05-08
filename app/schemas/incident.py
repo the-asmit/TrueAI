@@ -182,7 +182,7 @@ class IncidentResponse(BaseModel):
     level: Optional[str] = None
     platform: Optional[str] = None
     status: IncidentStatus
-    issue_classification: IssueClassification
+    issue_classification: Optional[IssueClassification] = None
     pipeline_error: Optional[str] = None
     created_at: datetime = Field(description="UTC timestamp when the row was created.")
     updated_at: Optional[datetime] = Field(

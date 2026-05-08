@@ -99,23 +99,19 @@ async def run_incident_pipeline(
         import asyncio as _asyncio
         from app.services.supabase import create_incident as _create_incident
 
+        _exception = payload.get("exception") or {}
+        _values = _exception.get("values") or [{}]
+        _first = _values[0] if _values else {}
+
         _incident_data = {
             "id": incident_id,
             "user_id": user_id,
             "sentry_event_id": event_id,
-            "error_type": (
-                payload.get("exception", {})
-                .get("values", [{}])[0]
-                .get("type", "unknown")
-            ),
-            "error_message": (
-                payload.get("exception", {})
-                .get("values", [{}])[0]
-                .get("value", "unknown")
-            ),
-            "stack_trace": payload.get("exception", {}),
+            "error_type": _first.get("type", "unknown"),
+            "error_message": _first.get("value", "unknown"),
+            "stack_trace": _exception or {},
             "environment": payload.get("environment", "unknown"),
-            "status": "processing",   # write final status directly; skip pending→processing round-trip
+            "status": "processing",
         }
 
         _created = await _asyncio.to_thread(_create_incident, _incident_data)
@@ -161,7 +157,11 @@ async def run_incident_pipeline(
                 _db_status = "flagged"
             else:
                 _db_status = status   # pass through whatever pipeline set
-            await _asyncio.to_thread(_update_incident, incident_id, {"status": _db_status})
+            await _asyncio.to_thread(_update_incident, incident_id, {
+                "status": _db_status,
+                "error_type": final_state.get("error_type") or "unknown",
+                "error_message": final_state.get("error_message") or "unknown",
+            })
         except Exception as _exc:
             logger.warning(
                 "Pipeline: could not update incident status | incident_id=%s | error=%s",
