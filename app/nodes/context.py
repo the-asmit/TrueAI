@@ -114,19 +114,14 @@ async def context_node(state: IncidentState) -> IncidentState:
 
         # ---- Evaluate result ---------------------------------------- #
         if not github_context and fetch_errors > 0:
-            state["error"] = (
-                f"Failed to fetch any GitHub files for {fetch_errors} attempted "
-                f"frame(s). The repository path in stack frames may not match "
-                f"the repository structure, or all files are inaccessible."
-            )
-            state["status"] = "failed"
-            logger.error(
+            logger.warning(
                 "context_node: ALL file fetches failed | incident_id=%s | "
-                "repo=%s | attempted=%d",
+                "repo=%s | attempted=%d — continuing with empty context",
                 incident_id,
                 repo_full_name,
                 fetch_errors,
             )
+            state["github_context"] = {}
             return state
 
         state["github_context"] = github_context
