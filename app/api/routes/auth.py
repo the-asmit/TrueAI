@@ -68,6 +68,13 @@ _GITHUB_SCOPES = "repo,read:user"
 _STATE_TTL_SECONDS = 900   # 15 minutes
 
 
+class ProfileUpdateRequest(BaseModel):
+    full_name: str
+ 
+class BranchSelectRequest(BaseModel):
+    branch_name: str
+
+
 # ================================================================== #
 # API key management                                                   #
 # ================================================================== #
@@ -221,6 +228,141 @@ async def set_github_repo(
 
 
 # ================================================================== #
+# User profile                                                         #
+# ================================================================== #
+
+@router.post(
+    "/profile",
+    summary="Save user profile info",
+)
+async def update_profile(
+    body: ProfileUpdateRequest,
+    user_id: str = Depends(require_current_user),
+) -> Dict[str, Any]:
+    """
+    Save the user's full name to their profile in Supabase.
+    """
+    full_name = body.full_name.strip()
+ 
+    if not full_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="full_name cannot be empty.",
+        )
+ 
+    if len(full_name) > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="full_name must be 100 characters or fewer.",
+        )
+ 
+    try:
+        from app.services.supabase import get_supabase
+ 
+        response = (
+            get_supabase()
+            .table("user_profiles")
+            .upsert({
+                "user_id": user_id,
+                "full_name": full_name,
+            }, on_conflict="user_id")
+            .execute()
+        )
+ 
+    except Exception as exc:
+        logger.error("update_profile: DB error | user_id=%s | error=%s", user_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save profile.",
+        )
+ 
+    logger.info("update_profile: saved | user_id=%s | name=%s", user_id, full_name)
+    return {"status": "ok", "full_name": full_name}
+ 
+
+# ================================================================== #
+# GitHub branch                                                        #
+# ================================================================== #
+
+@router.post(
+    "/github/branch",
+    summary="Set the production branch for the connected repository",
+)
+async def set_github_branch(
+    body: BranchSelectRequest,
+    user_id: str = Depends(require_current_user),
+) -> Dict[str, Any]:
+    """
+    Store (or update) the production branch TrueAI will use when
+    analyzing incidents and opening fix PRs.
+    """
+    branch_name = body.branch_name.strip()
+ 
+    if not branch_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="branch_name cannot be empty.",
+        )
+ 
+    # Ensure GitHub is connected and repo is set first
+    try:
+        from app.services.supabase import get_supabase
+ 
+        gh_response = (
+            get_supabase()
+            .table("github_tokens")
+            .select("github_username, repo_name")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = gh_response.data or []
+ 
+    except Exception as exc:
+        logger.error("set_github_branch: DB error | user_id=%s | error=%s", user_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch GitHub connection status.",
+        )
+ 
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Connect GitHub and set a repository first.",
+        )
+ 
+    if not rows[0].get("repo_name"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Set a repository first via POST /auth/github/repo.",
+        )
+ 
+    # Save branch to github_tokens row
+    try:
+        from app.services.supabase import get_supabase
+ 
+        (
+            get_supabase()
+            .table("github_tokens")
+            .update({"branch_name": branch_name})
+            .eq("user_id", user_id)
+            .execute()
+        )
+ 
+    except Exception as exc:
+        logger.error("set_github_branch: update error | user_id=%s | error=%s", user_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save branch.",
+        )
+ 
+    logger.info("set_github_branch: saved | user_id=%s | branch=%s", user_id, branch_name)
+    return {"status": "ok", "branch_name": branch_name}
+
+
+
+# ================================================================== #
 # Webhook URL helper                                                   #
 # ================================================================== #
 
@@ -316,6 +458,46 @@ async def revoke_api_key(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to revoke API key.",
+        )
+
+
+# ================================================================== #
+# Delete account                                                       #
+# ================================================================== #
+
+@router.delete(
+    "/account",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete the authenticated user's account",
+)
+async def delete_account(
+    user_id: str = Depends(require_current_user),
+) -> None:
+    """
+    Permanently delete the authenticated user's account and all associated data.
+    This action is irreversible.
+    """
+    try:
+        from app.services.supabase import get_supabase
+        from supabase import create_client
+        from app.core.config import settings as app_settings
+
+        # Need service role client to delete auth users
+        admin_client = create_client(
+            app_settings.SUPABASE_URL,
+            app_settings.SUPABASE_SERVICE_ROLE_KEY
+        )
+
+        # Delete the user from Supabase Auth (cascades to all tables via FK)
+        admin_client.auth.admin.delete_user(user_id)
+
+        logger.info("delete_account: user deleted | user_id=%s", user_id)
+
+    except Exception as exc:
+        logger.error("delete_account: error | user_id=%s | error=%s", user_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete account.",
         )
 
 
@@ -469,11 +651,12 @@ async def get_me(
     try:
         from app.services.supabase import get_supabase
 
-        # Check if GitHub is connected
+        client = get_supabase()
+
+        # Check GitHub connection
         gh_response = (
-            get_supabase()
-            .table("github_tokens")
-            .select("github_username, repo_name, created_at")
+            client.table("github_tokens")
+            .select("github_username, repo_name, branch_name, created_at")
             .eq("user_id", user_id)
             .order("created_at", desc=True)
             .limit(1)
@@ -481,11 +664,23 @@ async def get_me(
         )
         github_row = (gh_response.data or [None])[0]
 
+        # Check user profile
+        profile_response = (
+            client.table("user_profiles")
+            .select("full_name")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        profile_row = (profile_response.data or [None])[0]
+
         return {
             "user_id": user_id,
+            "full_name": (profile_row or {}).get("full_name"),
             "github_connected": github_row is not None,
             "github_username": (github_row or {}).get("github_username"),
             "github_repo": (github_row or {}).get("repo_name"),
+            "github_branch": (github_row or {}).get("branch_name"),
         }
 
     except Exception as exc:
