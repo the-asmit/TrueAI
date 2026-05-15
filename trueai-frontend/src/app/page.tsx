@@ -8,6 +8,19 @@ import {
   Activity, FileText, Link as LinkIcon, Brain,
   ArrowRight,
 } from 'lucide-react'
+import { createClient } from '@/lib/supabase/client'
+
+// ─── auth hook ────────────────────────────────────────────────────────────────
+
+function useIsLoggedIn() {
+  const [loggedIn, setLoggedIn] = useState(false)
+  useEffect(() => {
+    createClient().auth.getSession().then(({ data }) => {
+      setLoggedIn(!!data.session)
+    })
+  }, [])
+  return loggedIn
+}
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
@@ -59,6 +72,9 @@ const fadeUp = (delay = 0): Variants => ({
 function Navbar() {
   const [scrolled, setScrolled] = useState(false)
   const [open, setOpen] = useState(false)
+  const loggedIn = useIsLoggedIn()
+  const ctaHref  = loggedIn ? '/dashboard' : '/signup'
+  const ctaLabel = loggedIn ? 'Go to Dashboard' : 'Get Started'
 
   useEffect(() => {
     const fn = () => setScrolled(window.scrollY > 8)
@@ -89,8 +105,8 @@ function Navbar() {
         </nav>
 
         {/* Desktop CTA */}
-        <Link href="/signup" className="hidden md:inline-flex items-center gap-1.5 border border-[#23252a] text-[#f7f8f8] text-[13px] px-4 py-2 rounded-lg hover:bg-[#0f1011] transition-colors">
-          Get Started <ArrowRight size={12} />
+        <Link href={ctaHref} className="hidden md:inline-flex items-center gap-1.5 border border-[#23252a] text-[#f7f8f8] text-[13px] px-4 py-2 rounded-lg hover:bg-[#0f1011] transition-colors">
+          {ctaLabel} <ArrowRight size={12} />
         </Link>
 
         {/* Hamburger */}
@@ -106,9 +122,9 @@ function Navbar() {
             {links.map(l => (
               <a key={l.href} href={l.href} onClick={() => setOpen(false)} className="text-[13px] text-[#8a8f98] hover:text-[#f7f8f8] transition-colors">{l.label}</a>
             ))}
-            <Link href="/signup" onClick={() => setOpen(false)}
+            <Link href={ctaHref} onClick={() => setOpen(false)}
               className="inline-flex items-center justify-center border border-[#23252a] text-[#f7f8f8] text-[13px] px-4 py-2 rounded-lg hover:bg-[#0f1011] transition-colors">
-              Get Started →
+              {ctaLabel} →
             </Link>
           </motion.div>
         )}
@@ -167,6 +183,9 @@ function Terminal() {
 
 
 function HeroSection() {
+  const loggedIn  = useIsLoggedIn()
+  const primaryHref  = loggedIn ? '/dashboard' : '/signup'
+  const primaryLabel = loggedIn ? 'Go to Dashboard' : 'Get Started Free'
   return (
     <section className="min-h-screen flex flex-col items-center justify-center pt-20 pb-24 px-6">
       {/* Badge */}
@@ -193,9 +212,9 @@ function HeroSection() {
 
       {/* CTAs */}
       <motion.div variants={fadeUp(0.88)} initial="hidden" animate="visible" className="mt-8 flex flex-wrap gap-3 justify-center">
-        <Link href="/signup"
+        <Link href={primaryHref}
           className="bg-[#ededed] text-[#010102] text-[14px] font-medium px-5 py-2.5 rounded-lg hover:bg-white transition-colors">
-          Get Started Free
+          {primaryLabel}
         </Link>
         <a href="#how-it-works"
           className="border border-[#23252a] text-[#8a8f98] hover:text-[#f7f8f8] hover:border-[#34343a] text-[14px] px-5 py-2.5 rounded-lg transition-all">
@@ -399,6 +418,9 @@ function ContactSection() {
 // ─── CTA Banner ───────────────────────────────────────────────────────────────
 
 function CTABannerSection() {
+  const loggedIn   = useIsLoggedIn()
+  const bannerHref  = loggedIn ? '/dashboard' : '/signup'
+  const bannerLabel = loggedIn ? 'Go to Dashboard' : 'Get Started Free'
   return (
     <section className="py-24 px-6 bg-[#111111] border-y border-[#23252a]">
       <motion.div variants={fadeUp(0)} initial="hidden" whileInView="visible" viewport={{ once: true, margin: '-60px' }}
@@ -409,9 +431,9 @@ function CTABannerSection() {
         <p className="text-[#8a8f98] text-[15px] mb-8">
           Join engineering teams using TrueAI to eliminate incident toil.
         </p>
-        <Link href="/signup"
+        <Link href={bannerHref}
           className="inline-flex items-center gap-2 bg-[#ededed] text-[#010102] text-[14px] font-medium px-6 py-3 rounded-lg hover:bg-white transition-colors">
-          Get Started Free <ArrowRight size={14} />
+          {bannerLabel} <ArrowRight size={14} />
         </Link>
       </motion.div>
     </section>
