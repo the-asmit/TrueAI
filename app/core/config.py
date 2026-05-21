@@ -36,10 +36,10 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------ #
-    # Anthropic                                                            #
+    # Groq                                                                 #
     # ------------------------------------------------------------------ #
-    ANTHROPIC_API_KEY: str = Field(
-        description="Anthropic API key for Claude access.",
+    GROQ_API_KEY: str = Field(
+        description="Groq API key for LLaMA model access.",
     )
 
     # ------------------------------------------------------------------ #
@@ -148,7 +148,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "API_KEY_SECRET",
-        "ANTHROPIC_API_KEY",
+        "GROQ_API_KEY",
         "SUPABASE_ANON_KEY",
         "SUPABASE_SERVICE_ROLE_KEY",
         "SUPABASE_JWT_SECRET",
