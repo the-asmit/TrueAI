@@ -63,7 +63,7 @@ Client App
 | Token encryption | Fernet symmetric encryption (cryptography library) |
 | Database | Supabase (PostgreSQL) |
 | Schema validation | Pydantic v2 |
-| Auth | Supabase JWT (ES256 / ECDSA P-256) + HMAC-signed API keys + Sentry webhook HMAC-SHA256 signature |
+| Auth | Supabase JWT (ES256 / ECDSA P-256 via hardcoded public JWK — no network call) + HMAC-signed API keys + Sentry webhook HMAC-SHA256 signature |
 
 ---
 
@@ -78,16 +78,17 @@ TrueAI/
 ├── README.md
 ├── logs/
 │   └── .gitkeep
+├── trueai-frontend/                 # React frontend (separate package)
 ├── app/
 │   ├── api/
 │   │   ├── dependencies.py          # Shared FastAPI dependencies (JWT, API key auth)
 │   │   └── routes/
-│   │       ├── auth.py              # Auth routes: API keys, GitHub OAuth, repo selection
-│   │       ├── incidents.py         # Incident query routes
+│   │       ├── auth.py              # Auth routes: API keys, GitHub OAuth, repo/branch selection, profile, account deletion
+│   │       ├── incidents.py         # Incident CRUD routes: list, get, update, fix, PR sub-resources
 │   │       └── webhook.py           # POST /webhook/sentry (HMAC sig verify + rate limit)
 │   ├── auth/
 │   │   ├── api_keys.py              # HMAC-SHA256 key generation, hashing, masking
-│   │   └── jwt.py                   # Supabase JWT verification (ES256 / ECDSA P-256 via public JWK); rejects service_role tokens
+│   │   └── jwt.py                   # Supabase JWT verification (ES256 / ECDSA P-256 via hardcoded public JWK); rejects service_role tokens
 │   ├── core/
 │   │   ├── config.py                # Pydantic-settings config loader
 │   │   ├── graph.py                 # LangGraph pipeline graph definition
@@ -107,15 +108,15 @@ TrueAI/
 │   ├── pipelines/
 │   │   └── incident_pipeline.py     # Pipeline entry point called by Celery
 │   ├── schemas/
-│   │   ├── webhook.py               # Sentry webhook Pydantic models
-│   │   ├── incident.py              # Incident Pydantic models
 │   │   ├── fix.py                   # Fix + PR Pydantic models + confidence thresholds
-│   │   └── github.py                # GitHub file context + PR request models
+│   │   ├── github.py                # GitHub file context + PR request models
+│   │   ├── incident.py              # Incident Pydantic models (status enum, list/response schemas)
+│   │   └── webhook.py               # Sentry webhook Pydantic models
 │   ├── services/
 │   │   ├── crypto.py                # Fernet encrypt/decrypt for GitHub OAuth tokens
-│   │   ├── supabase.py              # Supabase client + all DB helper functions
 │   │   ├── redis.py                 # Redis client + dedup + cache helpers
 │   │   ├── sentry.py                # Sentry REST API client — fetches full event by event_id (parser fallback)
+│   │   ├── supabase.py              # Supabase client + all DB helper functions
 │   │   └── github/
 │   │       ├── client.py            # PyGithub wrappers + dynamic default branch resolver
 │   │       ├── fetcher.py           # Fetch + slice source files from GitHub
@@ -311,11 +312,14 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 |---|---|---|---|
 | `POST` | `/auth/api-keys` | JWT | Generate a new API key. Raw key returned once only. |
 | `DELETE` | `/auth/api-keys/{key_id}` | JWT | Revoke an API key (soft-delete, sets `is_active=false`). |
+| `POST` | `/auth/profile` | JWT | Save user profile info. Body: `{"full_name": "..."}`. |
 | `GET` | `/auth/github/authorize` | JWT | Start GitHub OAuth flow. Returns `auth_url` to redirect browser to. |
 | `GET` | `/auth/github/callback` | None (OAuth) | GitHub OAuth callback. Exchanges code for token, encrypts and stores it, redirects to frontend. |
 | `POST` | `/auth/github/repo` | JWT | Set the GitHub repository TrueAI will open PRs against. Body: `{"repo_name": "owner/repo"}`. |
+| `POST` | `/auth/github/branch` | JWT | Set the production branch for the connected repo. Body: `{"branch_name": "main"}`. |
 | `GET` | `/auth/user/webhook-url` | JWT | Returns the user's personalised Sentry webhook URL (uses key prefix, never full key). |
-| `GET` | `/auth/me` | JWT | Returns user info: `user_id`, `github_connected`, `github_username`, `github_repo`. |
+| `GET` | `/auth/me` | JWT | Returns user info: `user_id`, `full_name`, `github_connected`, `github_username`, `github_repo`, `github_branch`. |
+| `DELETE` | `/auth/account` | JWT | Permanently delete the authenticated user's account and all associated data. Irreversible. |
 
 ### Webhooks
 
@@ -327,8 +331,11 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/incidents` | JWT or API key | List incidents for the authenticated user. |
-| `GET` | `/incidents/{incident_id}` | JWT or API key | Get a single incident with its fix and PR details. |
+| `GET` | `/incidents` | JWT or API key | List incidents for the authenticated user. Supports `?status=`, `?classification=`, `?page=`, `?page_size=` filters. |
+| `GET` | `/incidents/{incident_id}` | JWT or API key | Get a single incident record. |
+| `PATCH` | `/incidents/{incident_id}` | JWT or API key | Partially update an incident's `status`, `issue_classification`, or `pipeline_error`. |
+| `GET` | `/incidents/{incident_id}/fix` | JWT or API key | Get the generated code fix (diff) for an incident. |
+| `GET` | `/incidents/{incident_id}/pr` | JWT or API key | Get the GitHub pull request record for an incident. |
 
 ---
 
@@ -422,6 +429,12 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 | `email` | text | |
 | `created_at` | timestamptz | |
 
+### `user_profiles`
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | uuid | PK / FK → profiles.id |
+| `full_name` | text | Display name (max 100 chars); set via `POST /auth/profile` |
+
 ### `api_keys`
 | Column | Type | Notes |
 |---|---|---|
@@ -440,12 +453,15 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 | `sentry_event_id` | text | Sentry's own event UUID |
 | `error_type` | text | e.g. `KeyError`, `NullPointerException` |
 | `error_message` | text | |
-| `stack_trace` | jsonb | Raw Sentry exception object |
 | `environment` | text | e.g. `production`, `staging` |
-| `status` | text | `pending` (inserted pre-pipeline), `processing`, `resolved`, `flagged`, `failed`, `duplicate` |
+| `level` | text | Sentry severity level: `debug`, `info`, `warning`, `error`, `fatal` |
+| `platform` | text | Runtime platform: `python`, `javascript`, etc. |
+| `raw_payload` | jsonb | Complete original Sentry webhook payload for audit / re-processing |
+| `status` | text | `pending` (inserted pre-pipeline), `processing`, `resolved`, `flagged`, `failed` |
 | `issue_classification` | text | `code_bug`, `config_issue`, `infrastructure`, `data_issue`, `dependency`, `unknown` |
 | `pipeline_error` | text | Error message captured when the pipeline fails; NULL on success |
 | `created_at` | timestamptz | |
+| `updated_at` | timestamptz | Updated automatically on any row change |
 
 ### `fixes`
 | Column | Type | Notes |
@@ -467,6 +483,7 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 | `access_token` | text | GitHub OAuth token, **Fernet-encrypted at rest** |
 | `github_username` | text | |
 | `repo_name` | text | `owner/repo` format |
+| `branch_name` | text | Production branch to target for PRs (e.g. `main`); set via `POST /auth/github/branch` |
 | `created_at` | timestamptz | |
 
 ### `pull_requests`
@@ -494,7 +511,17 @@ Create an account via Supabase Auth. Use the Supabase client in your frontend:
 const { data, error } = await supabase.auth.signUp({ email, password })
 ```
 
-### Step 2 — Generate an API key
+### Step 2 — Save your profile (optional)
+
+```http
+POST /auth/profile
+Authorization: Bearer <supabase_jwt>
+Content-Type: application/json
+
+{ "full_name": "Your Name" }
+```
+
+### Step 3 — Generate an API key
 
 ```http
 POST /auth/api-keys
@@ -506,14 +533,14 @@ Response:
 {
   "id": "uuid",
   "raw_key": "tai_xxxxxxxxxxxx...",
-  "key_prefix": "tai_xxxx",
-  "message": "Store this key immediately — it will not be shown again."
+  "key_prefix": "tai_xxxxxxxxxxxx",
+  "message": "Store this key immediately — it will not be shown again. Use it as: X-API-Key: <raw_key>  or  ?key=<raw_key>"
 }
 ```
 
 Store `raw_key` securely. It is shown **once only**.
 
-### Step 3 — Connect GitHub
+### Step 4 — Connect GitHub
 
 ```http
 GET /auth/github/authorize
@@ -527,7 +554,7 @@ Response:
 
 Redirect your browser to `auth_url`. After authorising, GitHub redirects back to TrueAI and the token is encrypted and stored automatically.
 
-### Step 4 — Set your repository
+### Step 5 — Set your repository
 
 ```http
 POST /auth/github/repo
@@ -537,7 +564,19 @@ Content-Type: application/json
 { "repo_name": "your-org/your-repo" }
 ```
 
-### Step 5 — Get your webhook URL
+### Step 6 — Set your production branch (optional)
+
+```http
+POST /auth/github/branch
+Authorization: Bearer <supabase_jwt>
+Content-Type: application/json
+
+{ "branch_name": "main" }
+```
+
+If not set, TrueAI resolves the repository's default branch dynamically at PR creation time.
+
+### Step 7 — Get your webhook URL
 
 ```http
 GET /auth/user/webhook-url
@@ -552,7 +591,7 @@ Response:
 }
 ```
 
-### Step 6 — Add to Sentry
+### Step 8 — Add to Sentry
 
 1. Go to your Sentry project → **Settings → Developer Settings → Webhooks**
 2. Click **Create Webhook**
@@ -570,7 +609,8 @@ TrueAI will now receive every new error from your Sentry project and attempt to 
 
 - **Single repo per user** — each GitHub account can only target one repository at a time. Multi-repo support requires schema changes.
 - **No PR merge tracking** — `pull_requests.status` is set to `open` and never updated. Merge webhooks from GitHub are not implemented.
-- **No multitenancy isolation at DB layer** — Row Level Security (RLS) is bypassed via the service-role key. API-layer isolation is enforced, but a misconfigured route could leak data.
+- **No multitenancy isolation at DB layer** — Row Level Security (RLS) is bypassed via the service-role key. API-layer isolation is enforced at the application layer, but a misconfigured route could leak data.
+- **Hardcoded Supabase JWK** — the ES256 public key used for JWT verification is embedded in `app/auth/jwt.py`. Rotating the Supabase signing key requires a code change.
 
 ---
 
