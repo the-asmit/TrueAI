@@ -4,7 +4,7 @@ TrueAI FastAPI application entry point.
 Startup sequence
 ────────────────
 1. Lifespan handler eagerly initialises every singleton (Supabase, Redis,
-   Anthropic LLM) so the first request never pays the cold-start penalty
+   Groq LLM) so the first request never pays the cold-start penalty
    and misconfigured credentials surface at boot time, not mid-request.
 2. Routers are registered with path prefixes and OpenAPI tags.
 3. CORS, request-ID injection, and global exception handlers are attached.
@@ -76,13 +76,13 @@ async def lifespan(app: FastAPI):
         logger.error("Redis connection FAILED at startup: %s", exc)
         raise
 
-    # Anthropic LLM client — validates API key format
+    # Groq LLM client — validates API key format
     try:
         from app.core.llm import get_llm
         get_llm()
-        logger.info("Anthropic LLM client: OK")
+        logger.info("Groq LLM client: OK")
     except Exception as exc:
-        logger.error("Anthropic LLM client FAILED at startup: %s", exc)
+        logger.error("Groq LLM client FAILED at startup: %s", exc)
         raise
 
     # Fernet encryption key — validates GITHUB_TOKEN_ENCRYPTION_KEY format
@@ -133,7 +133,7 @@ app = FastAPI(
     title="TrueAI",
     description=(
         "AI-powered incident analysis system. "
-        "Receives Sentry webhooks, analyses errors with Claude, "
+        "Receives Sentry webhooks, analyses errors with Groq LLaMA, "
         "fetches relevant source from GitHub, generates fixes, "
         "and opens pull requests automatically."
     ),
