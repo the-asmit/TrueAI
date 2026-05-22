@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
@@ -371,11 +372,27 @@ def _extract_file_diff(diff: str, file_path: str) -> str:
     Extract the portion of *diff* that applies to *file_path*.
 
     Splits on ``--- `` headers to isolate individual file sections.
+
+    Resolution order:
+      1. Exact match: ``+++ b/{file_path}`` or ``+++ {file_path}``.
+      2. Basename match: ``+++ b/{basename}`` or ``+++ {basename}``.
+         Handles the case where the diff was generated against the original
+         unresolved path (e.g. ``main.py``) but the file was committed to a
+         resolved path (e.g. ``backend/main.py``) via repo tree search.
     """
     sections = re.split(r"(?=^--- )", diff, flags=re.MULTILINE)
+
+    # Pass 1: exact path match
     for section in sections:
         if f"+++ b/{file_path}" in section or f"+++ {file_path}" in section:
             return section
+
+    # Pass 2: basename match
+    basename = Path(file_path).name
+    for section in sections:
+        if f"+++ b/{basename}" in section or f"+++ {basename}" in section:
+            return section
+
     return ""
 
 
@@ -463,15 +480,40 @@ async def _commit_file_change(
             repo = get_repository(access_token, repo_full_name)
             try:
                 contents = repo.get_contents(file_path, ref=branch_name)
-                return repo, contents
+                return repo, contents, file_path
             except GithubException as e:
                 if e.status == 404:
-                    # Try from default branch
-                    contents = repo.get_contents(file_path)
-                    return repo, contents
+                    # Try to find the file by searching the repo tree
+                    try:
+                        tree = repo.get_git_tree(sha="HEAD", recursive=True)
+                        filename = file_path.replace("\\", "/").split("/")[-1]
+                        matches = [
+                            el.path for el in tree.tree
+                            if el.type == "blob" and el.path.endswith(filename)
+                        ]
+                        if len(matches) == 1:
+                            resolved_path = matches[0]
+                        elif len(matches) > 1:
+                            # Score by right-to-left path-part overlap
+                            orig_parts = file_path.replace("\\", "/").split("/")
+                            def score(p):
+                                cand_parts = p.split("/")
+                                overlap = sum(
+                                    1 for a, b in zip(
+                                        reversed(orig_parts), reversed(cand_parts)
+                                    ) if a == b
+                                )
+                                return (overlap, -len(cand_parts))
+                            resolved_path = max(matches, key=score)
+                        else:
+                            raise  # no match found, re-raise original 404
+                        contents = repo.get_contents(resolved_path, ref=branch_name)
+                        return repo, contents, resolved_path
+                    except Exception:
+                        raise e
                 raise
 
-        repo, contents = await asyncio.to_thread(_get_contents)
+        repo, contents, file_path = await asyncio.to_thread(_get_contents)
 
         # Handle directory case (get_contents returns list for dirs)
         if isinstance(contents, list):

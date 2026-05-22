@@ -408,6 +408,46 @@ class SentryWebhookPayload(BaseModel):
             return None
         return str(v).lower()
 
+    @model_validator(mode="before")
+    @classmethod
+    def extract_nested_event_data(cls, data: Any) -> Any:
+        """
+        Promote fields from a nested ``event`` key up to the top level.
+
+        Some Sentry webhook formats (e.g. issue.created alerts) wrap the
+        actual error event inside a top-level ``event`` key rather than
+        inlining it directly.  This validator normalises both shapes so the
+        rest of the model always sees a flat structure.
+
+        Fields promoted (only when the top-level field is absent/empty):
+          - ``exception``  — the exception chain with stack frames
+          - ``message``    — human-readable error message
+          - ``level``      — severity level string
+          - ``timestamp``  — event capture time
+        """
+        if not isinstance(data, dict):
+            return data
+
+        nested_event = data.get("event", {}) or {}
+
+        # If top-level exception is missing/empty, use nested event's exception
+        if not data.get("exception") and nested_event.get("exception"):
+            data["exception"] = nested_event["exception"]
+
+        # If top-level message is missing, use nested event's message
+        if not data.get("message") and nested_event.get("message"):
+            data["message"] = nested_event["message"]
+
+        # If top-level level is missing, use nested event's level
+        if not data.get("level") and nested_event.get("level"):
+            data["level"] = nested_event["level"]
+
+        # If top-level timestamp is missing, use nested event's timestamp
+        if not data.get("timestamp") and nested_event.get("timestamp"):
+            data["timestamp"] = nested_event["timestamp"]
+
+        return data
+
     # ---------------------------------------------------------------- #
     # Public helpers                                                     #
     # ---------------------------------------------------------------- #

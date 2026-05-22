@@ -161,6 +161,7 @@ async def run_incident_pipeline(
                 "status": _db_status,
                 "error_type": final_state.get("error_type") or "unknown",
                 "error_message": final_state.get("error_message") or "unknown",
+                "issue_classification": final_state.get("issue_classification"),
             })
         except Exception as _exc:
             logger.warning(

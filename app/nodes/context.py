@@ -20,6 +20,7 @@ directly in an async function would block the event loop.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
@@ -269,14 +270,34 @@ async def _fetch_file_window(
         )
 
         if raw_content is None:
-            logger.warning(
-                "context_node: get_file_content returned None for '%s' in '%s' | "
-                "incident_id=%s",
-                file_path,
-                repo_full_name,
-                incident_id,
+            # ---- Fallback: search the repo tree for the file ---------- #
+            resolved_path = await _find_file_in_repo(
+                access_token, repo_full_name, file_path
             )
-            return None
+            if resolved_path and resolved_path != file_path:
+                logger.info(
+                    "context_node: resolved '%s' → '%s' via repo tree search | "
+                    "incident_id=%s",
+                    file_path,
+                    resolved_path,
+                    incident_id,
+                )
+                raw_content = await asyncio.to_thread(
+                    get_file_content,
+                    access_token,
+                    repo_full_name,
+                    resolved_path,
+                )
+
+            if raw_content is None:
+                logger.warning(
+                    "context_node: get_file_content returned None for '%s' in '%s' "
+                    "(including fallback tree search) | incident_id=%s",
+                    file_path,
+                    repo_full_name,
+                    incident_id,
+                )
+                return None
 
         windowed = _extract_window(raw_content, lineno)
         logger.debug(
@@ -337,6 +358,108 @@ async def _fetch_file_window(
             exc,
         )
         return None
+
+
+# ------------------------------------------------------------------ #
+# Repo tree path resolution                                            #
+# ------------------------------------------------------------------ #
+
+async def _find_file_in_repo(
+    access_token: str,
+    repo_full_name: str,
+    file_path: str,
+) -> Optional[str]:
+    """
+    Search the repository's full git tree for a file that matches the
+    basename of *file_path*, returning the best-matching full path.
+
+    Resolution algorithm:
+      1. Fetch the recursive git tree via ``repo.get_git_tree(sha="HEAD",
+         recursive=True)``.
+      2. Extract the basename from *file_path* (e.g. ``main.py`` from
+         ``backend/app/main.py``).
+      3. Collect every blob whose path ends with that basename.
+      4. Zero matches  → return None.
+      5. One match     → return that path directly.
+      6. Many matches  → score each candidate by counting right-to-left
+         path-part overlaps with the original *file_path*, then return the
+         highest-scoring candidate (shorter path wins on ties).
+
+    Args:
+        access_token:   Decrypted GitHub OAuth token.
+        repo_full_name: ``owner/repo`` string.
+        file_path:      The path that failed to resolve directly.
+
+    Returns:
+        A resolved repository-relative path string, or None if no match
+        is found or an error occurs.
+    """
+    def _search_tree() -> Optional[str]:
+        from app.services.github.client import get_github_client, get_repository
+        from github import GithubException
+
+        try:
+            client = get_github_client(access_token)
+            repo = get_repository(client, repo_full_name)
+
+            # Fetch the full recursive tree (expensive but cached by GitHub)
+            tree = repo.get_git_tree(sha="HEAD", recursive=True)
+
+            filename = Path(file_path).name  # e.g. "main.py"
+
+            # Collect all blobs whose path ends with the target filename
+            candidates = [
+                element.path
+                for element in tree.tree
+                if element.type == "blob"
+                and element.path.endswith(filename)
+            ]
+
+            if not candidates:
+                return None
+
+            if len(candidates) == 1:
+                return candidates[0]
+
+            # Score candidates by right-to-left path-part overlap
+            original_parts = Path(file_path).parts
+
+            def _overlap_score(candidate: str) -> tuple:
+                candidate_parts = Path(candidate).parts
+                # Count matching parts from the right
+                score = 0
+                for orig, cand in zip(
+                    reversed(original_parts), reversed(candidate_parts)
+                ):
+                    if orig == cand:
+                        score += 1
+                    else:
+                        break
+                # Negate length so shorter paths win on equal score (min depth)
+                return (score, -len(candidate_parts))
+
+            return max(candidates, key=_overlap_score)
+
+        except GithubException as exc:
+            logger.warning(
+                "context_node: git tree fetch failed for '%s' in '%s': %s — %s",
+                file_path,
+                repo_full_name,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "context_node: unexpected error in _find_file_in_repo for '%s': "
+                "%s — %s",
+                file_path,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    return await asyncio.to_thread(_search_tree)
 
 
 # ------------------------------------------------------------------ #

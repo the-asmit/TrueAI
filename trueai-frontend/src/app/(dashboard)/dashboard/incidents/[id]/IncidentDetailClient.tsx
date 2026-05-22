@@ -24,7 +24,7 @@ export interface Fix {
   root_cause: string;
   explanation: string;
   fix_diff: string;
-  confidence_score: number;
+  confidence: number | string;
   created_at: string;
 }
 
@@ -282,7 +282,7 @@ export function IncidentDetailClient({ incident, fix, pr }: Props) {
 
           {/* Fix Confidence (only when fix exists) */}
           {fix && (() => {
-            const confidence = getConfidenceColor(fix.confidence_score)
+            const confidence = getConfidenceColor(parseFloat(String(fix.confidence)))
             return (
               <div className="bg-[#0f1011] border border-[#23252a] rounded-xl p-5">
                 <p className="text-[11px] font-medium text-[#62666d] uppercase tracking-wider mb-4">Fix Confidence</p>
@@ -291,14 +291,14 @@ export function IncidentDetailClient({ incident, fix, pr }: Props) {
                     className="text-[28px] font-semibold leading-none"
                     style={{ color: confidence.text }}
                   >
-                    {Math.round(fix.confidence_score * 100)}%
+                    {Math.round(parseFloat(String(fix.confidence)) * 100)}%
                   </span>
                 </div>
                 <div className="h-1.5 w-full bg-[#23252a] rounded-full overflow-hidden">
                   <div
                     className="h-full rounded-full transition-all"
                     style={{
-                      width: `${Math.max(5, fix.confidence_score * 100)}%`,
+                      width: `${Math.max(5, parseFloat(String(fix.confidence)) * 100)}%`,
                       backgroundColor: confidence.bar
                     }}
                   />
