@@ -395,12 +395,11 @@ async def _find_file_in_repo(
         is found or an error occurs.
     """
     def _search_tree() -> Optional[str]:
-        from app.services.github.client import get_github_client, get_repository
+        from app.services.github.client import get_repository
         from github import GithubException
 
         try:
-            client = get_github_client(access_token)
-            repo = get_repository(client, repo_full_name)
+            repo = get_repository(access_token, repo_full_name)
 
             # Fetch the full recursive tree (expensive but cached by GitHub)
             tree = repo.get_git_tree(sha="HEAD", recursive=True)

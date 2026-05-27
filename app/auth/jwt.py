@@ -1,18 +1,18 @@
 """
 Supabase JWT verification for TrueAI.
 
-Supabase signs all JWTs with HS256 using the project's ``JWT_SECRET``.
+Supabase signs all JWTs with ES256 (ECDSA P-256) using the project's public key.
 This module verifies those tokens server-side without making any network
 calls — all validation is purely cryptographic.
 
 Verification guarantees
 ───────────────────────
-1. Signature   — rejects tokens signed with a different secret.
+1. Signature   — rejects tokens signed with a different key.
 2. Expiry      — rejects tokens whose ``exp`` claim is in the past.
 3. Subject     — rejects tokens with a missing or empty ``sub`` claim
                  (Supabase populates ``sub`` with the user's UUID).
-4. Algorithm   — only HS256 is accepted; RS256/none/other are rejected
-                 to prevent algorithm-confusion attacks.
+4. Algorithm   — only ES256 is accepted; HS256/RS256/none/other are
+                 rejected to prevent algorithm-confusion attacks.
 
 All failure modes raise ``HTTPException(401)`` with a descriptive
 (but non-leaking) ``detail`` message so the API layer can return a
@@ -32,9 +32,9 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Supabase exclusively uses HS256; accepting other algorithms opens the
-# door to algorithm-confusion attacks (e.g. RS256 with a public key as
-# the secret, or the "alg: none" bypass).
+# Supabase uses ES256 (ECDSA P-256) for JWT signing; accepting other
+# algorithms opens the door to algorithm-confusion attacks (e.g. HS256
+# with the public key as the secret, or the "alg: none" bypass).
 _ALGORITHM: str = "ES256"
 
 # Supabase audience claim expected value.  Supabase sets aud="authenticated"

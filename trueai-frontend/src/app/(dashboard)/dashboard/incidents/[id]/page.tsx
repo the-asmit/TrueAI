@@ -8,6 +8,11 @@ export const metadata: Metadata = {
   title: 'Incident Detail — TrueAI',
 }
 
+// Disable route caching so the server always fetches fresh incident/fix data.
+// This prevents hydration mismatches caused by stale cached status values
+// (e.g. status was 'processing' in cache but 'flagged' in the live DB).
+export const dynamic = 'force-dynamic'
+
 interface PageProps {
   params: Promise<{ id: string }>
 }

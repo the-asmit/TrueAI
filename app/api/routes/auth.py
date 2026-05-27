@@ -709,7 +709,7 @@ def _encode_oauth_state(user_id: str, redirect_uri: Optional[str] = None) -> str
         settings.API_KEY_SECRET.encode("utf-8"),
         encoded.encode("utf-8"),
         hashlib.sha256,
-    ).hexdigest()[:16]
+    ).hexdigest()[:32]
     return f"{encoded}.{sig}"
 
 
@@ -726,7 +726,7 @@ def _decode_oauth_state(state: str) -> Optional[Dict[str, Any]]:
             settings.API_KEY_SECRET.encode("utf-8"),
             encoded.encode("utf-8"),
             hashlib.sha256,
-        ).hexdigest()[:16]
+        ).hexdigest()[:32]
 
         if not hmac.compare_digest(sig, expected_sig):
             return None

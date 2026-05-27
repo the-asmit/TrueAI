@@ -174,21 +174,74 @@ export function IncidentDetailClient({ incident, fix, pr }: Props) {
               <Terminal size={16} className="text-[#62666d]" />
               <h2 className="text-[13px] font-medium text-[#f7f8f8]">Root Cause Analysis</h2>
             </div>
-            {!fix ? (
+            {!fix && incident.status.toLowerCase() !== 'flagged' ? (
               <div className="p-5 flex flex-col items-center justify-center py-14 text-center">
                 <div className="w-8 h-8 rounded-full border-2 border-t-[#ededed] border-r-transparent border-b-transparent border-l-transparent animate-spin mb-4" />
                 <p className="text-[14px] text-[#8a8f98]">Analysis pending...</p>
                 <p className="text-[12px] text-[#62666d] mt-1">This may take a few moments</p>
               </div>
+            ) : incident.status.toLowerCase() === 'flagged' ? (
+              <div className="p-5 space-y-4">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[12px] font-medium text-[#f59e0b] uppercase tracking-wider">Flagged for Human Review</span>
+                </div>
+
+                {fix?.explanation ? (
+                  <div className="p-4 bg-[#f59e0b]/5 border border-[#f59e0b]/20 rounded-lg">
+                    <p className="text-[13px] text-[#f7f8f8] leading-relaxed whitespace-pre-wrap">{fix.explanation}</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="p-4 bg-[#f59e0b]/5 border border-[#f59e0b]/20 rounded-lg space-y-3">
+                      <p className="text-[13px] text-[#f7f8f8] leading-relaxed">
+                        <span className="font-medium">Error: </span>
+                        {incident.error_type}: {incident.error_message}
+                      </p>
+                      {incident.issue_classification && (
+                        <p className="text-[13px] text-[#f7f8f8] leading-relaxed">
+                          <span className="font-medium">Classification: </span>
+                          <span className="capitalize">{incident.issue_classification.replace('_', ' ')}</span>
+                          {' \u2014 this type of issue cannot be resolved with a code patch and requires manual intervention.'}
+                        </p>
+                      )}
+                    </div>
+                    <div className="p-4 bg-[#0f1011] border border-[#23252a] rounded-lg">
+                      <p className="text-[11px] font-medium text-[#62666d] uppercase tracking-wider mb-2">Recommended Steps</p>
+                      {incident.issue_classification === 'config_issue' ? (
+                        <ol className="text-[13px] text-[#8a8f98] leading-relaxed space-y-1 list-decimal list-inside">
+                          <li>Check your environment variables and config files for the value referenced in the error</li>
+                          <li>Verify the configuration is set correctly in all environments (dev, staging, prod)</li>
+                          <li>Restart the affected service after updating the configuration</li>
+                          <li>Add startup validation to catch missing config at boot time</li>
+                        </ol>
+                      ) : incident.issue_classification === 'infrastructure' ? (
+                        <ol className="text-[13px] text-[#8a8f98] leading-relaxed space-y-1 list-decimal list-inside">
+                          <li>Check the health of the affected infrastructure component (database, cache, external API)</li>
+                          <li>Review recent deployment changes, scaling events, or network configuration</li>
+                          <li>Check service quotas and resource limits (memory, connections, disk)</li>
+                          <li>Add health checks and alerting for the affected component</li>
+                        </ol>
+                      ) : (
+                        <ol className="text-[13px] text-[#8a8f98] leading-relaxed space-y-1 list-decimal list-inside">
+                          <li>Review the error details and stack trace in Sentry</li>
+                          <li>Investigate the root cause manually</li>
+                          <li>Apply the appropriate fix for your environment</li>
+                          <li>Add monitoring to detect similar issues in future</li>
+                        </ol>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             ) : (
               <div className="p-5 space-y-5">
                 <div>
                   <p className="text-[11px] font-medium text-[#62666d] uppercase tracking-wider mb-2">Root Cause</p>
-                  <p className="text-[14px] text-[#f7f8f8] leading-relaxed">{fix.root_cause}</p>
+                  <p className="text-[14px] text-[#f7f8f8] leading-relaxed">{fix?.root_cause}</p>
                 </div>
                 <div className="pt-4 border-t border-[#23252a]">
                   <p className="text-[11px] font-medium text-[#62666d] uppercase tracking-wider mb-2">Explanation</p>
-                  <p className="text-[14px] text-[#8a8f98] leading-relaxed">{fix.explanation}</p>
+                  <p className="text-[14px] text-[#8a8f98] leading-relaxed">{fix?.explanation}</p>
                 </div>
               </div>
             )}
@@ -200,9 +253,26 @@ export function IncidentDetailClient({ incident, fix, pr }: Props) {
               <FileCode size={16} className="text-[#62666d]" />
               <h2 className="text-[13px] font-medium text-[#f7f8f8]">Proposed Fix Diff</h2>
             </div>
-            {!fix ? (
-              <div className="p-5 flex items-center justify-center py-14">
-                <p className="text-[13px] text-[#62666d]">Diff will appear here once the fix is generated.</p>
+            {!fix || incident.status.toLowerCase() === 'flagged' ? (
+              <div className="p-5 py-10">
+                {incident.status.toLowerCase() === 'flagged' ? (
+                  <div className="text-center space-y-2">
+                    <p className="text-[13px] text-[#62666d]">
+                      No code patch was generated because this is a{' '}
+                      <span className="text-[#f59e0b] capitalize">{incident.issue_classification?.replace('_', ' ') || 'non-code'}</span>{' '}
+                      issue.
+                    </p>
+                    <p className="text-[12px] text-[#62666d]">
+                      {incident.issue_classification === 'config_issue'
+                        ? 'Check your .env, config files, or secrets manager for the misconfigured value.'
+                        : incident.issue_classification === 'infrastructure'
+                        ? 'Check your infrastructure dashboard, service health endpoints, and recent deployment logs.'
+                        : 'Review the root cause analysis above for manual remediation steps.'}
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-[13px] text-[#62666d] text-center">Diff will appear here once the fix is generated.</p>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">

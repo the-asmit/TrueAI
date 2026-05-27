@@ -19,13 +19,14 @@ Parsing rules (strictly enforced per project spec):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.core.llm import call_llm_with_retry, get_llm
+from app.core.llm import get_llm
 from app.core.logging import get_logger
 from app.core.state import IncidentState
 
@@ -71,28 +72,69 @@ async def fix_generator_node(state: IncidentState) -> IncidentState:
     try:
         # ---- Short-circuit for unfixable categories ------------------- #
         if classification in _UNFIXABLE_CLASSIFICATIONS:
-            reason = (
-                f"Issue classified as '{classification}'. "
-                "Automated code fixes are not appropriate for this category — "
-                "human intervention is required to resolve configuration or "
-                "infrastructure problems."
-            )
+            suggestion = await _generate_manual_fix_suggestion(state)
             state["fix_diff"] = ""
             state["files_changed"] = []
             state["action"] = "flag_for_review"
-            # Append the reason to explanation so reviewers understand why
-            existing_explanation = state.get("explanation", "")
-            state["explanation"] = (
-                f"{existing_explanation}\n\n[No automated fix generated] {reason}"
-                if existing_explanation
-                else f"[No automated fix generated] {reason}"
-            )
+            state["explanation"] = suggestion
             logger.info(
                 "fix_generator_node: skipping LLM call for classification='%s' | "
                 "incident_id=%s",
                 classification,
                 incident_id,
             )
+
+            # ---- Persist a fix record for the frontend to display -------- #
+            # Even though there is no code patch, we save a fix row so the
+            # frontend can show the manual remediation guidance.
+            if suggestion:
+                try:
+                    from app.services.supabase import create_fix
+
+                    # fix_diff must be non-blank (DB / schema constraint).
+                    # root_cause may not be in state yet at this node — fall back
+                    # to a placeholder so the insert does not fail a NOT NULL check.
+                    _root_cause = state.get("root_cause") or (
+                        f"Flagged as {classification} — see explanation."
+                    )
+
+                    fix_record = await asyncio.to_thread(
+                        create_fix,
+                        {
+                            "incident_id": state.get("incident_id"),
+                            "root_cause": _root_cause,
+                            "explanation": suggestion,
+                            "fix_diff": "# No patch — manual fix required.",
+                            "confidence": 0.0,
+                            "files_changed": [],
+                            "validation_passed": False,
+                        },
+                    )
+                    if fix_record:
+                        state["fix_id"] = fix_record["id"]
+                        logger.info(
+                            "fix_generator_node: flagged fix record persisted | "
+                            "incident_id=%s | fix_id=%s",
+                            incident_id,
+                            fix_record["id"],
+                        )
+                    else:
+                        logger.warning(
+                            "fix_generator_node: create_fix returned None for flagged "
+                            "incident — DB insert may have failed silently | "
+                            "incident_id=%s",
+                            incident_id,
+                        )
+                except Exception as persist_exc:
+                    logger.error(
+                        "fix_generator_node: error persisting flagged fix | "
+                        "incident_id=%s | error_type=%s | error=%s",
+                        incident_id,
+                        type(persist_exc).__name__,
+                        persist_exc,
+                        exc_info=True,
+                    )
+
             return state
 
         # ---- LLM fix generation --------------------------------------- #
@@ -177,6 +219,119 @@ async def fix_generator_node(state: IncidentState) -> IncidentState:
             exc_info=True,
         )
         return state
+
+
+# ------------------------------------------------------------------ #
+# Manual fix suggestion (for unfixable classifications)                #
+# ------------------------------------------------------------------ #
+
+async def _generate_manual_fix_suggestion(state: IncidentState) -> str:
+    """
+    Call the LLM synchronously (via asyncio.to_thread) to produce a
+    structured, human-readable remediation guide for incidents classified
+    as unfixable (e.g. config_issue, infrastructure).
+
+    Uses llm.invoke() instead of ainvoke() so it is safe to run inside a
+    Celery worker where there may be no running event loop.
+
+    Falls back to a rich static message built from the incident's own data
+    if the LLM call fails for any reason, so reviewers always get useful
+    context.
+    """
+    error_type = state.get("error_type", "Unknown error")
+    error_message = state.get("error_message", "")
+    classification = state.get("issue_classification", "")
+    root_cause = state.get("root_cause", "")
+
+    prompt = f"""A production incident was flagged for human review because it is a '{classification}' issue that cannot be auto-fixed with a code patch.
+
+Error: {error_type}: {error_message}
+Root Cause: {root_cause}
+
+Provide a clear, actionable explanation for a developer:
+1. What exactly is wrong
+2. Step-by-step manual fix instructions
+3. How to prevent this in future
+
+Be concise and specific. No fluff."""
+
+    try:
+        llm = get_llm()
+        messages = [
+            SystemMessage(content="You are a senior DevOps/backend engineer explaining production incidents to developers."),
+            HumanMessage(content=prompt),
+        ]
+        # Use synchronous invoke inside to_thread — safe in Celery workers
+        # where there is no running event loop to run ainvoke.
+        response = await asyncio.to_thread(llm.invoke, messages)
+        return response.content or _static_manual_suggestion(
+            error_type, error_message, classification, root_cause
+        )
+    except Exception as exc:
+        logger.warning(
+            "fix_generator: LLM call for manual suggestion failed (%s: %s) — "
+            "using static fallback | classification=%s",
+            type(exc).__name__,
+            exc,
+            classification,
+        )
+        return _static_manual_suggestion(
+            error_type, error_message, classification, root_cause
+        )
+
+
+def _static_manual_suggestion(
+    error_type: str,
+    error_message: str,
+    classification: str,
+    root_cause: str,
+) -> str:
+    """
+    Build a structured, informative manual-review message from the incident's
+    own data when the LLM is unavailable.
+    """
+    guidance: dict = {
+        "config_issue": (
+            "Configuration issues cannot be resolved by changing application code.\n\n"
+            "Recommended steps:\n"
+            "1. Review your environment variables, secrets, and config files for the "
+            "value referenced in the error.\n"
+            "2. Verify the config is correctly set in all environments "
+            "(development, staging, production).\n"
+            "3. Restart the affected service after updating the config.\n"
+            "4. Add startup validation (e.g. Pydantic Settings) to catch missing "
+            "config at boot time rather than at runtime."
+        ),
+        "infrastructure": (
+            "Infrastructure issues require changes outside the application codebase.\n\n"
+            "Recommended steps:\n"
+            "1. Check the health of the affected infrastructure component "
+            "(database, cache, message broker, external API).\n"
+            "2. Review recent deployment changes, scaling events, or network "
+            "configuration updates.\n"
+            "3. Check service quotas and resource limits (memory, connections, disk).\n"
+            "4. Add health checks and alerting for the affected component to "
+            "detect failures earlier in future."
+        ),
+    }
+    type_guidance = guidance.get(
+        classification,
+        (
+            "This incident requires manual review.\n\n"
+            "Investigate the root cause listed above and apply the appropriate fix "
+            "for your environment."
+        ),
+    )
+
+    parts = [
+        f"Error: {error_type}: {error_message}" if error_message else f"Error: {error_type}",
+    ]
+    if root_cause:
+        parts.append(f"Root Cause: {root_cause}")
+    parts.append("")
+    parts.append(type_guidance)
+
+    return "\n".join(parts)
 
 
 # ------------------------------------------------------------------ #

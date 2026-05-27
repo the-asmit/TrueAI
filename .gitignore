@@ -39,6 +39,7 @@ graph.html
 GRAPH_REPORT.md
 .agents
 .graphifyignore
+graphify.bat
 
 # Redis dump
 dump.rdb

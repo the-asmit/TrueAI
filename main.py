@@ -20,10 +20,11 @@ Running in production
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -100,6 +101,19 @@ async def lifespan(app: FastAPI):
             "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
         ) from exc
 
+    # Sentry webhook signature — require in production to prevent spoofed payloads
+    if not settings.SENTRY_WEBHOOK_SECRET:
+        if _IS_PRODUCTION:
+            raise RuntimeError(
+                "SENTRY_WEBHOOK_SECRET must be set in production. "
+                "Get it from Sentry → Settings → Integrations → Webhooks → Signing Secret."
+            )
+        else:
+            logger.warning(
+                "SENTRY_WEBHOOK_SECRET not set — webhook signature verification "
+                "is DISABLED.  Set it before deploying to production."
+            )
+
     logger.info("TrueAI startup complete — ready to serve requests.")
     yield
 
@@ -129,6 +143,13 @@ def _webhook_key_func(request: Request) -> str:
     return request.query_params.get("key") or "anonymous"
 
 
+# ------------------------------------------------------------------ #
+# Environment detection                                                #
+# ------------------------------------------------------------------ #
+
+_IS_PRODUCTION: bool = os.getenv("ENV", "development").lower() == "production"
+
+
 app = FastAPI(
     title="TrueAI",
     description=(
@@ -138,9 +159,10 @@ app = FastAPI(
         "and opens pull requests automatically."
     ),
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
+    # Disable OpenAPI/Swagger UI in production to avoid exposing the API surface.
+    docs_url=None if _IS_PRODUCTION else "/docs",
+    redoc_url=None if _IS_PRODUCTION else "/redoc",
+    openapi_url=None if _IS_PRODUCTION else "/openapi.json",
     lifespan=lifespan,
 )
 
@@ -152,9 +174,16 @@ app.state.limiter = Limiter(key_func=_webhook_key_func)
 # Middleware                                                           #
 # ================================================================== #
 
+# Build CORS allow-list from CORS_ORIGINS env var (comma-separated),
+# falling back to localhost for development.  Never use "*" with credentials.
+_cors_origins_raw: str = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+_cors_origins: List[str] = [
+    origin.strip() for origin in _cors_origins_raw.split(",") if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten per-environment via env var if needed
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -217,7 +246,6 @@ async def validation_exception_handler(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "detail": exc.errors(),
-            "body": exc.body,
         },
     )
 
@@ -302,7 +330,7 @@ async def readiness_check() -> JSONResponse:
         get_redis().ping()
         checks["redis"] = "ok"
     except Exception as exc:
-        checks["redis"] = f"error: {exc}"
+        checks["redis"] = "error"
         healthy = False
 
     try:
@@ -311,7 +339,7 @@ async def readiness_check() -> JSONResponse:
         get_supabase().table("incidents").select("id").limit(1).execute()
         checks["supabase"] = "ok"
     except Exception as exc:
-        checks["supabase"] = f"error: {exc}"
+        checks["supabase"] = "error"
         healthy = False
 
     http_status = status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE

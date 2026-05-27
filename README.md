@@ -1,6 +1,6 @@
 # TrueAI
 
-**AI-powered incident analysis and auto-fix system.** TrueAI connects to Sentry, analyses runtime errors using Claude (Anthropic), fetches the relevant source code from GitHub, generates a code fix, and opens a pull request — fully automated.
+**AI-powered incident analysis and auto-fix system.** TrueAI connects to Sentry, analyses runtime errors using Groq (LLaMA 3.3 70B), fetches the relevant source code from GitHub, generates a code fix, and opens a pull request — fully automated. A Next.js dashboard lets you monitor incidents, view root cause analysis, and track generated fixes in real time.
 
 ---
 
@@ -19,7 +19,7 @@ Client App
     ├─ Verifies HMAC-SHA256 webhook signature (sentry-hook-signature header)
     ├─ Authenticates request via API key lookup
     ├─ Rate limits per API key (20 req/min by default)
-    ├─ Enqueues job to Redis
+    ├─ Enqueues job to Celery via Redis
     │
     ▼
   Celery Worker
@@ -29,11 +29,11 @@ Client App
     │
     ├─ parser_node        → normalise Sentry payload
     ├─ dedup_node         → skip duplicate events (Redis SET NX)
-    ├─ classifier_node    → classify error type (Claude)
+    ├─ classifier_node    → classify error type (Groq LLaMA)
     ├─ context_node       → fetch source files from GitHub
-    ├─ root_cause_node    → identify root cause (Claude)
-    ├─ fix_generator_node → generate unified diff patch (Claude)
-    ├─ validator_node     → validate patch (Claude)
+    ├─ root_cause_node    → identify root cause (Groq LLaMA)
+    ├─ fix_generator_node → generate unified diff patch (Groq LLaMA)
+    ├─ validator_node     → validate patch (Groq LLaMA)
     ├─ decision_node      → create_pr or flag_for_review
     └─ pr_creator_node    → apply diff + open GitHub PR
     │
@@ -44,7 +44,7 @@ Client App
   Supabase (incident, fix, PR records persisted)
     │
     ▼
-  Dashboard (planned — frontend not yet implemented)
+  Next.js Dashboard (view incidents, fixes, PR status, flagged guidance)
 ```
 
 ---
@@ -57,13 +57,14 @@ Client App
 | Task queue | Celery with exponential-backoff retry |
 | Broker / dedup cache | Redis |
 | AI orchestration | LangGraph |
-| LLM | Claude Sonnet (Anthropic) |
+| LLM | Groq — LLaMA 3.3 70B Versatile |
 | LLM resilience | Tenacity retry with exponential backoff (429/502/503) |
 | GitHub integration | PyGithub |
 | Token encryption | Fernet symmetric encryption (cryptography library) |
 | Database | Supabase (PostgreSQL) |
 | Schema validation | Pydantic v2 |
-| Auth | Supabase JWT (ES256 / ECDSA P-256 via hardcoded public JWK — no network call) + HMAC-signed API keys + Sentry webhook HMAC-SHA256 signature |
+| Auth | Supabase JWT (ES256 / ECDSA P-256 via hardcoded public JWK — no network call) + HMAC-SHA256 API keys + Sentry webhook HMAC-SHA256 signature |
+| Frontend | Next.js 14 (App Router) + Supabase Auth |
 
 ---
 
@@ -78,7 +79,7 @@ TrueAI/
 ├── README.md
 ├── logs/
 │   └── .gitkeep
-├── trueai-frontend/                 # React frontend (separate package)
+├── trueai-frontend/                 # Next.js dashboard (separate package)
 ├── app/
 │   ├── api/
 │   │   ├── dependencies.py          # Shared FastAPI dependencies (JWT, API key auth)
@@ -92,17 +93,17 @@ TrueAI/
 │   ├── core/
 │   │   ├── config.py                # Pydantic-settings config loader
 │   │   ├── graph.py                 # LangGraph pipeline graph definition
-│   │   ├── llm.py                   # Anthropic Claude client singleton + retry wrapper
+│   │   ├── llm.py                   # Groq LLaMA client singleton + retry wrapper
 │   │   ├── logging.py               # Structured logger with sensitive data masking
 │   │   └── state.py                 # IncidentState TypedDict + make_initial_state
 │   ├── nodes/
 │   │   ├── parser.py                # Parse and normalise Sentry webhook payload
 │   │   ├── dedup.py                 # Redis-based duplicate event detection
-│   │   ├── classifier.py            # Classify error type with Claude
+│   │   ├── classifier.py            # Classify error type with Groq LLaMA
 │   │   ├── context.py               # Fetch GitHub source files for stack frames
-│   │   ├── root_cause.py            # Root cause analysis with Claude
-│   │   ├── fix_generator.py         # Generate unified diff patch with Claude
-│   │   ├── validator.py             # Two-stage patch validation (syntax + Claude)
+│   │   ├── root_cause.py            # Root cause analysis with Groq LLaMA
+│   │   ├── fix_generator.py         # Generate unified diff patch with Groq LLaMA; persists manual guidance for flagged incidents
+│   │   ├── validator.py             # Two-stage patch validation (syntax + Groq LLaMA)
 │   │   ├── decision.py              # Decide: create_pr or flag_for_review
 │   │   └── pr_creator.py            # Apply diff + open GitHub PR
 │   ├── pipelines/
@@ -208,55 +209,79 @@ Create a `.env` file at the project root with the following keys:
 | Variable | Required | Description |
 |---|---|---|
 | `BASE_URL` | ✅ | Public base URL of the TrueAI server, e.g. `https://trueai.example.com`. Used to construct OAuth callback URLs and webhook URLs. |
-| `API_KEY_SECRET` | ✅ | Secret used to HMAC-sign API keys and OAuth state tokens. Use a cryptographically random 32+ char string. Never expose. |
-| `ANTHROPIC_API_KEY` | ✅ | Anthropic API key for Claude. Obtain from [console.anthropic.com](https://console.anthropic.com). |
+| `ENV` | ✅ | Deployment environment. Set to `production` to disable OpenAPI docs (`/docs`, `/redoc`) and enforce `SENTRY_WEBHOOK_SECRET`. Defaults to `development`. |
+| `API_KEY_SECRET` | ✅ | Secret used to HMAC-SHA256-sign API keys and OAuth state tokens. Must be a cryptographically random 32+ char string. Generate with: `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Never expose. |
+| `CORS_ORIGINS` | ✅ | Comma-separated list of allowed frontend origins. e.g. `https://app.trueai.com,http://localhost:3000`. Defaults to `http://localhost:3000` in development. |
+| `GROQ_API_KEY` | ✅ | Groq API key for LLaMA 3.3 70B. Obtain from [console.groq.com](https://console.groq.com). |
 | `SUPABASE_URL` | ✅ | Your Supabase project URL, e.g. `https://xyzxyz.supabase.co`. |
 | `SUPABASE_ANON_KEY` | ✅ | Supabase anonymous/public key. Used for client-side auth flows. |
 | `SUPABASE_SERVICE_ROLE_KEY` | ✅ | Supabase service-role key. Bypasses RLS — used server-side only. Never expose to clients. |
-| `SUPABASE_JWT_SECRET` | ✅ | JWT secret from Supabase project settings. Retained for legacy consumers; primary JWT verification now uses the Supabase ECC public JWK (ES256). |
 | `REDIS_URL` | ✅ | Redis connection URL, e.g. `redis://localhost:6379/0`. |
-| `CELERY_BROKER_URL` | ✅ | Celery broker URL (typically same as `REDIS_URL`), e.g. `redis://localhost:6379/0`. |
+| `CELERY_BROKER_URL` | ✅ | Celery broker URL (typically same as `REDIS_URL`). |
 | `CELERY_RESULT_BACKEND` | ✅ | Celery result backend URL, e.g. `redis://localhost:6379/1`. |
 | `GITHUB_CLIENT_ID` | ✅ | GitHub OAuth App client ID. Create an OAuth App in GitHub Developer Settings. |
 | `GITHUB_CLIENT_SECRET` | ✅ | GitHub OAuth App client secret. Never expose. |
 | `GITHUB_TOKEN_ENCRYPTION_KEY` | ✅ | Fernet symmetric key used to encrypt GitHub OAuth tokens at rest. Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
-| `SENTRY_AUTH_TOKEN` | ⚠️ Optional | Sentry API auth token (from **Settings → Auth Tokens**). Required for the parser's Sentry API fallback — if the inbound webhook carries no exception frames, `sentry.py` uses this token to fetch the full event. Without it the fallback is silently skipped. |
-| `SENTRY_ORG_SLUG` | ⚠️ Optional | Sentry organisation slug (e.g. `my-org`). Used to construct the Sentry REST API URL for full-event fetches. Defaults to `trueai-94`. |
-| `SENTRY_WEBHOOK_SECRET` | ⚠️ Optional | HMAC-SHA256 secret for verifying the `sentry-hook-signature` header on inbound webhooks. When absent, signature verification is skipped (fail-open). Strongly recommended in production. |
+| `SENTRY_AUTH_TOKEN` | ⚠️ Optional | Sentry API auth token. Required for the parser's Sentry API fallback when the inbound webhook carries no exception frames. |
+| `SENTRY_ORG_SLUG` | ⚠️ Optional | Sentry organisation slug (e.g. `my-org`). Used to construct the Sentry REST API URL. |
+| `SENTRY_WEBHOOK_SECRET` | ⚠️ Required in production | HMAC-SHA256 secret for verifying the `sentry-hook-signature` header. App refuses to start with `ENV=production` if not set. Get it from Sentry → Settings → Integrations → Webhooks → Signing Secret. |
 | `RATE_LIMIT_PER_MINUTE` | ⚠️ Optional | Maximum webhook requests per API key per minute. Defaults to `20`. |
 
 **Example `.env`:**
 
 ```env
+# APP
 BASE_URL=https://trueai.example.com
-API_KEY_SECRET=your-random-secret-here
+ENV=production
+API_KEY_SECRET=<48-byte random string>
+CORS_ORIGINS=https://app.trueai.com
 
-ANTHROPIC_API_KEY=sk-ant-...
+# LLM
+GROQ_API_KEY=gsk_...
 
+# SUPABASE
 SUPABASE_URL=https://xyzxyz.supabase.co
 SUPABASE_ANON_KEY=eyJ...
 SUPABASE_SERVICE_ROLE_KEY=eyJ...
-SUPABASE_JWT_SECRET=your-jwt-secret
 
+# REDIS / CELERY
 REDIS_URL=redis://localhost:6379/0
 CELERY_BROKER_URL=redis://localhost:6379/0
 CELERY_RESULT_BACKEND=redis://localhost:6379/1
 
+# GITHUB
 GITHUB_CLIENT_ID=Iv1.abc123
 GITHUB_CLIENT_SECRET=abc123secret
 GITHUB_TOKEN_ENCRYPTION_KEY=<base64-fernet-key>
 
+# SENTRY
 SENTRY_AUTH_TOKEN=sntrys_...
 SENTRY_ORG_SLUG=my-org
-SENTRY_WEBHOOK_SECRET=your-sentry-signing-secret
+SENTRY_WEBHOOK_SECRET=<sentry-signing-secret>
 RATE_LIMIT_PER_MINUTE=20
 ```
 
 ---
 
+## Security
+
+TrueAI is built with production security in mind:
+
+- **API key storage** — raw keys are never stored. Only the HMAC-SHA256 digest is persisted. Constant-time comparison (`hmac.compare_digest`) prevents timing attacks.
+- **JWT verification** — ES256 / ECDSA P-256 signature verification using Supabase's public JWK. No shared secrets. Algorithm confusion attacks (HS256, `alg: none`) are explicitly rejected.
+- **GitHub token encryption** — OAuth access tokens are encrypted at rest with Fernet (AES-128-CBC + HMAC-SHA256) before being stored in Supabase.
+- **OAuth state** — CSRF-resistant: state is a Base64-encoded JSON blob signed with HMAC-SHA256 (128-bit signature) and has a 15-minute expiry.
+- **Webhook signature** — Sentry webhook payloads are verified with HMAC-SHA256 using `sentry-hook-signature`. Required in production; app refuses to start without it.
+- **CORS** — restricted to explicit origins via `CORS_ORIGINS` env var. Wildcard `*` is never used.
+- **Log redaction** — `SensitiveDataFilter` strips API keys, JWTs, GitHub tokens, and Supabase keys from all log output before they reach the console or log files.
+- **Error responses** — all unhandled exceptions return generic 500 messages. No stack traces, file paths, or internal error details are ever sent to clients.
+- **OpenAPI docs** — `/docs`, `/redoc`, and `/openapi.json` are disabled when `ENV=production`.
+
+---
+
 ## Quick Test
 
-Once the server and worker are running, verify the pipeline end-to-end with a single `curl`:
+Once the server and worker are running, verify the pipeline end-to-end:
 
 ```bash
 curl -X POST "http://localhost:8000/webhook/sentry?key=<your_full_api_key>" \
@@ -270,7 +295,7 @@ curl -X POST "http://localhost:8000/webhook/sentry?key=<your_full_api_key>" \
       "values": [
         {
           "type": "KeyError",
-          "value": "'user_id' not found in session",
+          "value": "'\''user_id'\'' not found in session",
           "stacktrace": {
             "frames": [
               {
@@ -278,7 +303,7 @@ curl -X POST "http://localhost:8000/webhook/sentry?key=<your_full_api_key>" \
                 "lineno": 42,
                 "function": "get_dashboard",
                 "in_app": true,
-                "context_line": "    user = session['user_id']"
+                "context_line": "    user = session['\''user_id'\'']"
               }
             ]
           }
@@ -290,17 +315,17 @@ curl -X POST "http://localhost:8000/webhook/sentry?key=<your_full_api_key>" \
 
 Expected response (`HTTP 202`):
 ```json
-{ "status": "accepted", "incident_id": "<uuid>", "task_id": "<celery-task-uuid>" }
+{ "accepted": true, "event_id": "test-event-001", "task_id": "<celery-task-uuid>" }
 ```
 
-The Celery worker will then process the incident asynchronously. Query the result:
+The Celery worker processes the incident asynchronously. Query the result:
 
 ```bash
 curl "http://localhost:8000/incidents/<incident_id>" \
   -H "Authorization: Bearer <supabase_jwt>"
 ```
 
-> **Note:** If `SENTRY_WEBHOOK_SECRET` is set, add the corresponding HMAC header. Without it, signature verification is skipped (fail-open).
+> **Note:** Each `event_id` is deduplicated via Redis. Re-sending the same test payload is silently skipped. Use a unique `event_id` for each test.
 
 ---
 
@@ -325,7 +350,7 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/webhook/sentry` | API key (`?key=<full_api_key>`) + optional HMAC signature | Sentry webhook entry point. Verifies signature, validates key, enforces rate limit, enqueues pipeline. |
+| `POST` | `/webhook/sentry` | API key (`?key=<full_api_key>`) + HMAC signature | Sentry webhook entry point. Verifies signature, validates key, enforces rate limit, enqueues pipeline. |
 
 ### Incidents
 
@@ -334,61 +359,68 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 | `GET` | `/incidents` | JWT or API key | List incidents for the authenticated user. Supports `?status=`, `?classification=`, `?page=`, `?page_size=` filters. |
 | `GET` | `/incidents/{incident_id}` | JWT or API key | Get a single incident record. |
 | `PATCH` | `/incidents/{incident_id}` | JWT or API key | Partially update an incident's `status`, `issue_classification`, or `pipeline_error`. |
-| `GET` | `/incidents/{incident_id}/fix` | JWT or API key | Get the generated code fix (diff) for an incident. |
+| `GET` | `/incidents/{incident_id}/fix` | JWT or API key | Get the generated code fix (diff) or manual remediation guidance for an incident. |
 | `GET` | `/incidents/{incident_id}/pr` | JWT or API key | Get the GitHub pull request record for an incident. |
+
+### Health
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/health` | None | Liveness probe. Returns `{"status": "ok"}`. |
+| `GET` | `/health/ready` | None | Readiness probe. Checks Redis + Supabase. Returns 503 if any dependency is down. |
 
 ---
 
 ## Pipeline — Step by Step
 
 1. **Webhook received** (`POST /webhook/sentry?key=<full_api_key>`)
-   - HMAC-SHA256 signature verified against `sentry-hook-signature` header (if `SENTRY_WEBHOOK_SECRET` is set)
+   - HMAC-SHA256 signature verified against `sentry-hook-signature` header
    - API key authenticated via full key hash lookup in `api_keys` table
    - Per-key rate limit enforced (default: 20 req/min)
-   - Raw payload stored; Celery task enqueued
+   - Raw payload stored; Celery task enqueued; HTTP 202 returned immediately
 
 2. **`parser_node`**
    - Validates payload against `SentryWebhookPayload` Pydantic model
    - Extracts `error_type`, `error_message`, in-app stack frames, Sentry context
-   - **Sentry API fallback:** if the webhook payload carries no exception frames, fetches the full event from the Sentry API by `event_id` + `project_slug` and retries parsing
-   - Falls back from in-app frames → all frames when Sentry's `in_app` flag is absent (path heuristic used instead)
-   - Builds `frame_contexts` dict keyed by `filename:lineno` for inline source context in the root-cause prompt
-   - Sets `status="processing"` on success; fails fast if still no frames after fallback
+   - **Sentry API fallback:** if the webhook payload carries no exception frames, fetches the full event from the Sentry API by `event_id` + `project_slug`
+   - Falls back from in-app frames → all frames when `in_app` flag is absent (path heuristic)
+   - Builds `frame_contexts` dict keyed by `filename:lineno` for inline source context
+   - Sets `status="processing"` on success; fails fast if no frames found after fallback
 
 3. **`dedup_node`**
    - Checks Redis for `event_id` using atomic `SET NX EX 86400`
-   - Duplicate → sets `status="duplicate"`, pipeline exits
+   - Duplicate → sets `status="duplicate"`, pipeline exits immediately
    - Fail-open: Redis unavailable → continue processing
 
 4. **`classifier_node`**
-   - Sends error details to Claude
+   - Sends error details to Groq LLaMA 3.3 70B
    - Returns one of: `code_bug`, `config_issue`, `infrastructure`, `data_issue`, `dependency`
    - Soft-fail: defaults to `code_bug` on any error
 
 5. **`context_node`**
    - Fetches decrypted GitHub access token (Fernet-encrypted at rest) + repo from Supabase
    - For each in-app stack frame (up to 5 files): fetches source file via PyGithub
-   - Extracts ±30-line window around the error line, annotated with line numbers for precise LLM cross-referencing
+   - Extracts ±30-line window around the error line, annotated with line numbers
    - Each frame fetched independently — a single file failure never aborts the enrichment pass
-   - **Non-fatal all-fail:** if every frame fails, logs a WARNING and continues with empty `github_context` (does not set `status="failed"`)
+   - **Non-fatal all-fail:** if every frame fails, continues with empty `github_context`
 
 6. **`root_cause_node`**
-   - Sends all evidence (frames, source code, Sentry context) to Claude
+   - Sends all evidence (frames, source code, Sentry context) to Groq LLaMA
    - Extracts `root_cause`, `explanation`, `confidence` from XML-tagged response
    - Confidence < 0.40 → sets `action="flag_for_review"` early
    - Any missing field → `status="failed"`
 
 7. **`fix_generator_node`**
-   - `config_issue` or `infrastructure` → skip LLM, set `action="flag_for_review"`
-   - Otherwise: sends root cause + source code to Claude
+   - `config_issue` or `infrastructure` classification → skip LLM, set `action="flag_for_review"`, persist manual remediation guidance to `fixes` table
+   - Otherwise: sends root cause + source code to Groq LLaMA
    - Extracts unified diff patch and list of changed files
-   - Any missing field → `status="failed"`
+   - For flagged paths: persists `root_cause`, `explanation`, `confidence=0`, `fix_diff=""` to `fixes` table so the dashboard can display guidance
 
 8. **`validator_node`**
-   - Stage 1: structural diff syntax check (no LLM)
-   - Stage 2: Claude semantic review — `is_valid`, `critique`, `updated_confidence`
+   - Stage 1: structural diff syntax check (no LLM, no cost)
+   - Stage 2: Groq LLaMA semantic review — `is_valid`, `critique`, `updated_confidence`
    - On pass: persists fix to `fixes` table, stores `fix_id` in state
-   - Never sets `status="failed"` — validation failure routes to `flag_for_review`
+   - Validation failure routes to `flag_for_review` — never sets `status="failed"`
 
 9. **`decision_node`**
    - `confidence >= 0.75` AND `validation_passed=True` → `action="create_pr"`
@@ -397,23 +429,17 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 10. **`pr_creator_node`**
     - Resolves repository's actual default branch dynamically via GitHub API
     - Creates feature branch: `trueai/fix-{incident_id[:8]}`
-    - Applies unified diff file-by-file using pure-Python hunk applier
+    - Applies unified diff file-by-file using pure-Python hunk applier (no subprocess, no temp files)
     - Opens GitHub PR with structured Markdown body
     - Persists PR record to `pull_requests` table
     - Updates fix status: `applied` on success, `failed` on error
 
 11. **Pipeline complete**
     - `action="create_pr"` → incident `status="resolved"`
-    - `action="flag_for_review"` → incident `status="flagged"`
+    - `action="flag_for_review"` → incident `status="flagged"` (dashboard shows root cause + manual remediation guidance)
     - Unhandled exception → incident `status="failed"`
-    - DB status is updated post-graph; DB failures are non-fatal (logged as WARNING, never crash the pipeline)
 
-12. **Incident DB lifecycle**
-    - Row is inserted as `status="processing"` **before** the graph executes (so the incident is always visible even if the graph crashes)
-    - Post-graph: `create_pr` → `resolved`, `flag_for_review` → `flagged`, pipeline error → `failed`
-    - The returned failure dict always includes `incident_id` so the Celery task can attempt a final DB status update
-
-13. **Celery retry policy**
+12. **Celery retry policy**
     - Transient failures (network errors, upstream 5xx) → auto-retry up to 3 times
     - Backoff: 30 s → 60 s → 120 s (exponential: `30 × 2^n`)
     - `status="failed"` or `status="duplicate"` → no retry (permanent states)
@@ -457,7 +483,7 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 | `level` | text | Sentry severity level: `debug`, `info`, `warning`, `error`, `fatal` |
 | `platform` | text | Runtime platform: `python`, `javascript`, etc. |
 | `raw_payload` | jsonb | Complete original Sentry webhook payload for audit / re-processing |
-| `status` | text | `pending` (inserted pre-pipeline), `processing`, `resolved`, `flagged`, `failed` |
+| `status` | text | `processing`, `resolved`, `flagged`, `failed`, `duplicate` |
 | `issue_classification` | text | `code_bug`, `config_issue`, `infrastructure`, `data_issue`, `dependency`, `unknown` |
 | `pipeline_error` | text | Error message captured when the pipeline fails; NULL on success |
 | `created_at` | timestamptz | |
@@ -469,9 +495,9 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 | `id` | uuid | PK |
 | `incident_id` | uuid | FK → incidents.id |
 | `root_cause` | text | |
-| `explanation` | text | |
-| `fix_diff` | text | Unified diff patch |
-| `confidence` | float | 0.0 – 1.0 |
+| `explanation` | text | LLM explanation or manual remediation guidance for flagged incidents |
+| `fix_diff` | text | Unified diff patch; empty string for flagged/unfixable incidents |
+| `confidence` | float | 0.0 – 1.0; 0.0 for flagged incidents |
 | `status` | text | `pending`, `applied`, `failed` |
 | `created_at` | timestamptz | |
 
@@ -494,7 +520,7 @@ curl "http://localhost:8000/incidents/<incident_id>" \
 | `pr_url` | text | Full GitHub PR URL |
 | `pr_number` | int | GitHub PR number |
 | `branch_name` | text | e.g. `trueai/fix-a1b2c3d4` |
-| `status` | text | `open`, `merged`, `closed` — set to `open` on creation; merge/close tracking not yet implemented |
+| `status` | text | `open`, `merged`, `closed` — set to `open` on creation |
 | `created_at` | timestamptz | |
 
 ---
@@ -505,7 +531,7 @@ A step-by-step guide for a developer integrating TrueAI into their project.
 
 ### Step 1 — Sign up
 
-Create an account via Supabase Auth. Use the Supabase client in your frontend:
+Create an account via Supabase Auth (through the TrueAI dashboard or directly):
 
 ```js
 const { data, error } = await supabase.auth.signUp({ email, password })
@@ -534,11 +560,11 @@ Response:
   "id": "uuid",
   "raw_key": "tai_xxxxxxxxxxxx...",
   "key_prefix": "tai_xxxxxxxxxxxx",
-  "message": "Store this key immediately — it will not be shown again. Use it as: X-API-Key: <raw_key>  or  ?key=<raw_key>"
+  "message": "Store this key immediately — it will not be shown again."
 }
 ```
 
-Store `raw_key` securely. It is shown **once only**.
+Store `raw_key` securely. It is shown **once only**. If the `API_KEY_SECRET` is rotated on the server, all existing keys are invalidated and must be regenerated.
 
 ### Step 4 — Connect GitHub
 
@@ -552,7 +578,7 @@ Response:
 { "auth_url": "https://github.com/login/oauth/authorize?..." }
 ```
 
-Redirect your browser to `auth_url`. After authorising, GitHub redirects back to TrueAI and the token is encrypted and stored automatically.
+Redirect your browser to `auth_url`. After authorising, GitHub redirects back to TrueAI, and the token is encrypted and stored automatically.
 
 ### Step 5 — Set your repository
 
@@ -593,13 +619,10 @@ Response:
 
 ### Step 8 — Add to Sentry
 
-1. Go to your Sentry project → **Settings → Developer Settings → Webhooks**
-2. Click **Create Webhook**
-3. In **Name**, enter something like `TrueAI Auto-Fix`
-4. In **Webhook URL**, paste the `webhook_url` from Step 5
-5. In **Event Types**, select **Issue Created** (and optionally **Issue Resolved**)
-6. In **Signing Secret**, enter the value of your `SENTRY_WEBHOOK_SECRET` environment variable
-7. Click **Create**
+1. Go to your Sentry project → **Settings → Legacy Integrations → Webhooks**
+2. Paste the `webhook_url` from Step 7 into **Callback URLs**
+3. Click **Save Changes**, then **Test Plugin** to verify the connection
+4. In **Sentry → Settings → Integrations → Webhooks → Signing Secret**, copy the secret and set it as `SENTRY_WEBHOOK_SECRET` in your `.env`
 
 TrueAI will now receive every new error from your Sentry project and attempt to auto-fix it.
 
@@ -608,8 +631,8 @@ TrueAI will now receive every new error from your Sentry project and attempt to 
 ## Current Limitations
 
 - **Single repo per user** — each GitHub account can only target one repository at a time. Multi-repo support requires schema changes.
-- **No PR merge tracking** — `pull_requests.status` is set to `open` and never updated. Merge webhooks from GitHub are not implemented.
-- **No multitenancy isolation at DB layer** — Row Level Security (RLS) is bypassed via the service-role key. API-layer isolation is enforced at the application layer, but a misconfigured route could leak data.
+- **No PR merge tracking** — `pull_requests.status` is set to `open` on creation and never updated. GitHub merge webhooks are not implemented.
+- **No multitenancy isolation at DB layer** — RLS is bypassed via the service-role key. Tenant isolation is enforced at the application layer (all queries filter on `user_id`), but moving this into Supabase RLS is recommended for defence-in-depth.
 - **Hardcoded Supabase JWK** — the ES256 public key used for JWT verification is embedded in `app/auth/jwt.py`. Rotating the Supabase signing key requires a code change.
 
 ---
@@ -619,7 +642,6 @@ TrueAI will now receive every new error from your Sentry project and attempt to 
 - [ ] **Multi-repo support** — store multiple repos per user; route incidents to the correct repo by project/DSN
 - [ ] **GitHub webhook for PR merge tracking** — update `pull_requests.status` when PRs are merged or closed
 - [ ] **RLS enforcement** — move tenant isolation into Supabase RLS policies and use the anon key for row-scoped queries
-- [ ] **Dashboard UI** — React frontend for viewing incidents, fixes, PR status, and confidence scores
 - [ ] **Slack / PagerDuty notifications** — alert on `status="flagged"` incidents that need human review
 - [ ] **Confidence calibration** — collect feedback on merged vs. closed PRs to fine-tune confidence thresholds
 - [ ] **Support for JavaScript / TypeScript repos** — extend diff application and GitHub context fetching to handle source maps
