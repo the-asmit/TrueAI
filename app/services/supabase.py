@@ -1,515 +1,663 @@
 """
-Supabase client initialisation and database helper functions for TrueAI.
+Supabase client and every database query TrueAI makes.
 
 Design notes
 ────────────
-- The service-role key is used (not the anon key) so that all server-side
-  operations bypass Row Level Security.  The API layer is responsible for
-  enforcing tenant isolation before calling these helpers.
-- Every database call is wrapped in try/except.  DB errors are logged at
-  ERROR level with full context (table, operation, id) but are never
-  re-raised as raw exceptions — callers receive a typed return value
-  (None, empty list, or bool) so the pipeline can decide how to handle them.
-- Successes are logged at DEBUG level to keep INFO logs clean in production.
-- The Supabase Python client v2 raises ``APIError`` on non-2xx responses;
-  connection errors surface as ``httpx.RequestError`` subclasses.  Both are
-  caught explicitly.
+- The service-role key is used server-side (it bypasses Row Level Security),
+  so **every** query that touches tenant data filters on ``user_id`` here.
+  RLS policies in ``supabase/migrations`` are a second line of defence for
+  anything that reads the database with a user's own JWT (the dashboard).
+- Queries never use ``.single()``: PostgREST raises when zero rows match,
+  which would turn a normal "not found" into a 500.  We use ``.limit(1)``
+  and inspect the result instead.
+- Failures raise :class:`~app.core.errors.DatabaseError` so callers can map
+  them to a 503 (API) or a retryable pipeline failure (worker).  Nothing is
+  silently swallowed.
+- The Supabase SDK is synchronous.  API routes that call these helpers are
+  plain ``def`` functions (FastAPI runs them in a thread pool) and the async
+  pipeline wraps them in ``asyncio.to_thread``.
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional
 
 from supabase import Client, create_client
 
-from app.auth.api_keys import hash_api_key
 from app.core.config import settings
+from app.core.errors import DatabaseError
 from app.core.logging import get_logger
-from app.services.crypto import decrypt_token
 
 logger = get_logger(__name__)
 
 # ------------------------------------------------------------------ #
-# Singleton                                                            #
+# Client singleton                                                     #
 # ------------------------------------------------------------------ #
 
-_supabase_client: Optional[Client] = None
-_supabase_lock: threading.Lock = threading.Lock()
+_client: Optional[Client] = None
+_client_lock = threading.Lock()
 
-# Table names — centralised so a rename only touches this file.
-_T_INCIDENTS: str = "incidents"
-_T_FIXES: str = "fixes"
-_T_PULL_REQUESTS: str = "pull_requests"
-_T_API_KEYS: str = "api_keys"
-_T_GITHUB_TOKENS: str = "github_tokens"
+T_INCIDENTS = "incidents"
+T_FIXES = "fixes"
+T_PULL_REQUESTS = "pull_requests"
+T_STEPS = "pipeline_steps"
+T_API_KEYS = "api_keys"
+T_GITHUB_TOKENS = "github_tokens"
+T_REPO_MAPPINGS = "repo_mappings"
+T_SENTRY = "sentry_integrations"
+T_PROFILES = "user_profiles"
+
+# Columns returned by incident list views (raw_payload is large and never listed).
+INCIDENT_LIST_COLUMNS = (
+    "id,user_id,sentry_event_id,error_type,error_message,environment,level,platform,"
+    "status,issue_classification,severity,culprit,occurrence_count,last_seen_at,"
+    "sentry_project,repo_full_name,branch,current_step,confidence,pipeline_error,"
+    "created_at,updated_at,completed_at"
+)
+INCIDENT_DETAIL_COLUMNS = INCIDENT_LIST_COLUMNS + (
+    ",fingerprint,sentry_issue_id,sentry_issue_url,stack_trace,analysis_run,attempts,"
+    "started_at,llm_input_tokens,llm_output_tokens"
+)
+
+ACTIVE_INCIDENT_STATUSES = ("queued", "processing", "pr_open", "flagged")
 
 
 def get_supabase() -> Client:
-    """
-    Return the shared Supabase :class:`Client` singleton.
-
-    Constructed lazily on the first call and cached for the process lifetime.
-    Thread-safe via a module-level lock.
-
-    Raises:
-        RuntimeError: If the Supabase URL or service-role key is missing.
-        Exception: If the Supabase client cannot be initialised (propagated
-            to crash the app at startup rather than silently serving requests
-            against a broken DB connection).
-    """
-    global _supabase_client
-
-    if _supabase_client is not None:
-        return _supabase_client
-
-    with _supabase_lock:
-        if _supabase_client is not None:   # double-checked locking
-            return _supabase_client
-
-        logger.info("Initialising Supabase client (url=%s).", settings.SUPABASE_URL)
-        try:
-            _supabase_client = create_client(
+    """Return the shared service-role client (created on first use, thread-safe)."""
+    global _client
+    if _client is not None:
+        return _client
+    with _client_lock:
+        if _client is None:
+            logger.info("Initialising Supabase client (url=%s).", settings.SUPABASE_URL)
+            _client = create_client(
                 settings.SUPABASE_URL,
-                settings.SUPABASE_SERVICE_ROLE_KEY,
+                settings.secret("SUPABASE_SERVICE_ROLE_KEY") or "",
             )
-            logger.info("Supabase client ready.")
-        except Exception as exc:
-            logger.error(
-                "Failed to initialise Supabase client: %s — %s.",
-                type(exc).__name__,
-                exc,
-            )
-            raise
-
-    return _supabase_client
+    return _client
 
 
-# ------------------------------------------------------------------ #
-# API key helpers                                                      #
-# ------------------------------------------------------------------ #
-
-def get_user_by_api_key(raw_api_key: str) -> Optional[str]:
-    """
-    Look up a user by a raw API key.
-
-    The incoming key is hashed with HMAC-SHA256 before querying so the raw
-    value never touches the database layer.
-
-    Args:
-        raw_api_key: The raw ``tai_...`` key string presented by the caller.
-
-    Returns:
-        The ``user_id`` string if a matching, active key is found, or
-        ``None`` if the key is invalid, revoked, or a DB error occurred.
-    """
+def _run(description: str, fn):
+    """Execute a query builder callable, converting any failure to DatabaseError."""
     try:
-        hashed = hash_api_key(raw_api_key)
-    except ValueError:
-        logger.warning("get_user_by_api_key: invalid (empty) API key presented.")
-        return None
-
-    try:
-        client = get_supabase()
-        response = (
-            client.table(_T_API_KEYS)
-            .select("user_id, is_active")
-            .eq("api_key", hashed)
-            .single()
-            .execute()
-        )
-
-        row: Optional[Dict[str, Any]] = response.data
-        if not row:
-            logger.debug("API key lookup: no matching key found.")
-            return None
-
-        user_id: str = row["user_id"]
-        if row.get("is_active") is False:
-            logger.info("API key is revoked.")
-            return None
-        logger.debug("API key lookup: resolved to user_id=%s.", user_id)
-        return user_id
-
+        return fn()
+    except DatabaseError:
+        raise
     except Exception as exc:
-        logger.error(
-            "DB error in get_user_by_api_key: %s — %s.",
-            type(exc).__name__,
-            exc,
-        )
-        return None
+        logger.error("Database error during %s: %s — %s", description, type(exc).__name__, exc)
+        raise DatabaseError(f"Database error during {description}.") from exc
 
 
-# ------------------------------------------------------------------ #
-# Incident helpers                                                     #
-# ------------------------------------------------------------------ #
+def _first(rows: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    return rows[0] if rows else None
 
-def create_incident(incident_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Insert a new row into the ``incidents`` table.
 
-    Args:
-        incident_data: Column-value dict matching the incidents schema.
-            The ``id`` column should be omitted — Supabase generates a UUID.
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    Returns:
-        The created row as a dict (including the server-assigned ``id`` and
-        ``created_at``), or ``None`` on failure.
-    """
+
+def ping() -> bool:
     try:
-        client = get_supabase()
-        response = (
-            client.table(_T_INCIDENTS)
-            .insert(incident_data)
-            .execute()
-        )
-
-        rows: List[Dict[str, Any]] = response.data or []
-        if not rows:
-            logger.error(
-                "create_incident: insert returned empty data for payload=%s.",
-                _safe_repr(incident_data),
-            )
-            return None
-
-        created = rows[0]
-        logger.debug(
-            "create_incident: created incident id=%s for user_id=%s.",
-            created.get("id"),
-            created.get("user_id"),
-        )
-        return created
-
+        get_supabase().table(T_INCIDENTS).select("id").limit(1).execute()
+        return True
     except Exception as exc:
-        logger.error(
-            "DB error in create_incident: %s — %s. Payload keys: %s.",
-            type(exc).__name__,
-            exc,
-            list(incident_data.keys()),
-        )
+        logger.warning("Supabase ping failed: %s", exc)
+        return False
+
+
+# ================================================================== #
+# Incidents                                                            #
+# ================================================================== #
+
+def create_incident(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Insert an incident row and return it."""
+    response = _run("create_incident", lambda: get_supabase().table(T_INCIDENTS).insert(data).execute())
+    row = _first(response.data)
+    if row is None:
+        raise DatabaseError("create_incident returned no row.")
+    return row
+
+
+def update_incident(incident_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Update an incident by id (worker-side; ownership was established at creation)."""
+    if not data:
         return None
+    response = _run(
+        "update_incident",
+        lambda: get_supabase().table(T_INCIDENTS).update(data).eq("id", incident_id).execute(),
+    )
+    return _first(response.data)
 
 
-def update_incident(
-    incident_id: str,
-    update_data: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """
-    Update an existing incident row by its UUID primary key.
-
-    Args:
-        incident_id: UUID string of the incident to update.
-        update_data: Column-value dict of fields to change.
-
-    Returns:
-        The updated row as a dict, or ``None`` on failure.
-    """
-    if not update_data:
-        logger.warning(
-            "update_incident called with empty update_data for id=%s — no-op.",
-            incident_id,
-        )
-        return None
-
-    try:
-        client = get_supabase()
-        response = (
-            client.table(_T_INCIDENTS)
-            .update(update_data)
-            .eq("id", incident_id)
-            .execute()
-        )
-
-        rows: List[Dict[str, Any]] = response.data or []
-        if not rows:
-            logger.error(
-                "update_incident: update returned empty data for id=%s.",
-                incident_id,
-            )
-            return None
-
-        updated = rows[0]
-        logger.debug(
-            "update_incident: updated incident id=%s, fields=%s.",
-            incident_id,
-            list(update_data.keys()),
-        )
-        return updated
-
-    except Exception as exc:
-        logger.error(
-            "DB error in update_incident (id=%s): %s — %s.",
-            incident_id,
-            type(exc).__name__,
-            exc,
-        )
-        return None
+def update_incident_for_user(incident_id: str, user_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "update_incident_for_user",
+        lambda: get_supabase()
+        .table(T_INCIDENTS)
+        .update(data)
+        .eq("id", incident_id)
+        .eq("user_id", user_id)
+        .execute(),
+    )
+    return _first(response.data)
 
 
-# ------------------------------------------------------------------ #
-# Fix helpers                                                          #
-# ------------------------------------------------------------------ #
-
-def create_fix(fix_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Insert a new row into the ``fixes`` table.
-
-    Args:
-        fix_data: Column-value dict matching the fixes schema.
-
-    Returns:
-        The created row as a dict, or ``None`` on failure.
-    """
-    try:
-        client = get_supabase()
-        response = (
-            client.table(_T_FIXES)
-            .insert(fix_data)
-            .execute()
-        )
-
-        rows: List[Dict[str, Any]] = response.data or []
-        if not rows:
-            logger.error(
-                "create_fix: insert returned empty data. incident_id=%s.",
-                fix_data.get("incident_id"),
-            )
-            return None
-
-        created = rows[0]
-        logger.debug(
-            "create_fix: created fix id=%s for incident_id=%s.",
-            created.get("id"),
-            created.get("incident_id"),
-        )
-        return created
-
-    except Exception as exc:
-        logger.error(
-            "DB error in create_fix: %s — %s. incident_id=%s.",
-            type(exc).__name__,
-            exc,
-            fix_data.get("incident_id"),
-        )
-        return None
+def get_incident(incident_id: str, user_id: str, columns: str = INCIDENT_DETAIL_COLUMNS) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "get_incident",
+        lambda: get_supabase()
+        .table(T_INCIDENTS)
+        .select(columns)
+        .eq("id", incident_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
 
 
-def update_fix(
-    fix_id: str,
-    update_data: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """
-    Update an existing fix row by its UUID primary key.
-
-    Args:
-        fix_id: UUID string of the fix to update.
-        update_data: Column-value dict of fields to change.
-
-    Returns:
-        The updated row as a dict, or ``None`` on failure.
-    """
-    if not update_data:
-        logger.warning(
-            "update_fix called with empty update_data for id=%s — no-op.",
-            fix_id,
-        )
-        return None
-
-    try:
-        client = get_supabase()
-        response = (
-            client.table(_T_FIXES)
-            .update(update_data)
-            .eq("id", fix_id)
-            .execute()
-        )
-
-        rows: List[Dict[str, Any]] = response.data or []
-        if not rows:
-            logger.error(
-                "update_fix: update returned empty data for id=%s.",
-                fix_id,
-            )
-            return None
-
-        updated = rows[0]
-        logger.debug(
-            "update_fix: updated fix id=%s, fields=%s.",
-            fix_id,
-            list(update_data.keys()),
-        )
-        return updated
-
-    except Exception as exc:
-        logger.error(
-            "DB error in update_fix (id=%s): %s — %s.",
-            fix_id,
-            type(exc).__name__,
-            exc,
-        )
-        return None
+def get_incident_for_worker(incident_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch the full incident row including raw_payload (worker only)."""
+    response = _run(
+        "get_incident_for_worker",
+        lambda: get_supabase().table(T_INCIDENTS).select("*").eq("id", incident_id).limit(1).execute(),
+    )
+    return _first(response.data)
 
 
-# ------------------------------------------------------------------ #
-# Pull request helpers                                                 #
-# ------------------------------------------------------------------ #
+def list_incidents(
+    user_id: str,
+    *,
+    page: int,
+    page_size: int,
+    status: Optional[str] = None,
+    classification: Optional[str] = None,
+    search: Optional[str] = None,
+) -> tuple[List[Dict[str, Any]], int]:
+    offset = (page - 1) * page_size
 
-def create_pull_request(pr_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Insert a new row into the ``pull_requests`` table.
-
-    Args:
-        pr_data: Column-value dict matching the pull_requests schema.
-
-    Returns:
-        The created row as a dict, or ``None`` on failure.
-    """
-    try:
-        client = get_supabase()
-        response = (
-            client.table(_T_PULL_REQUESTS)
-            .insert(pr_data)
-            .execute()
-        )
-
-        rows: List[Dict[str, Any]] = response.data or []
-        if not rows:
-            logger.error(
-                "create_pull_request: insert returned empty data. fix_id=%s.",
-                pr_data.get("fix_id"),
-            )
-            return None
-
-        created = rows[0]
-        logger.debug(
-            "create_pull_request: created PR record id=%s, pr_number=%s.",
-            created.get("id"),
-            created.get("pr_number"),
-        )
-        return created
-
-    except Exception as exc:
-        logger.error(
-            "DB error in create_pull_request: %s — %s. fix_id=%s.",
-            type(exc).__name__,
-            exc,
-            pr_data.get("fix_id"),
-        )
-        return None
-
-
-# ------------------------------------------------------------------ #
-# GitHub token helpers                                                 #
-# ------------------------------------------------------------------ #
-
-def get_github_token(user_id: str) -> Optional[str]:
-    """
-    Retrieve the stored GitHub OAuth access token for *user_id*.
-
-    Args:
-        user_id: TrueAI workspace user identifier.
-
-    Returns:
-        The raw access token string if found and active, or ``None``.
-
-    Security note:
-        The returned token is a credential.  Callers must not log it.
-        This function deliberately logs only a masked representation.
-    """
-    try:
-        client = get_supabase()
-        response = (
-            client.table(_T_GITHUB_TOKENS)
-            .select("access_token")
+    def _query():
+        query = (
+            get_supabase()
+            .table(T_INCIDENTS)
+            .select(INCIDENT_LIST_COLUMNS, count="exact")
             .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
         )
+        if status:
+            query = query.eq("status", status)
+        if classification:
+            query = query.eq("issue_classification", classification)
+        if search:
+            pattern = f"*{search}*"
+            query = query.or_(f"error_type.ilike.{pattern},error_message.ilike.{pattern},culprit.ilike.{pattern}")
+        return query.order("last_seen_at", desc=True, nullsfirst=False).order("created_at", desc=True).range(
+            offset, offset + page_size - 1
+        ).execute()
 
-        rows: List[Dict[str, Any]] = response.data or []
-        if not rows:
-            logger.debug(
-                "get_github_token: no token found for user_id=%s.", user_id
-            )
-            return None
+    response = _run("list_incidents", _query)
+    return response.data or [], response.count or 0
 
-        row = rows[0]
-        encrypted: str = row["access_token"]
-        token: str = decrypt_token(encrypted)
-        logger.debug(
-            "get_github_token: token retrieved for user_id=%s (prefix=%s...).",
-            user_id,
-            token[:4] if len(token) >= 4 else "****",
-        )
-        return token
 
-    except Exception as exc:
-        logger.error(
-            "DB error in get_github_token (user_id=%s): %s — %s.",
-            user_id,
-            type(exc).__name__,
-            exc,
-        )
+def incident_status_counts(user_id: str) -> Dict[str, int]:
+    """Return ``{status: count}`` for the user (one grouped query via RPC)."""
+    response = _run(
+        "incident_status_counts",
+        lambda: get_supabase().rpc("incident_status_counts", {"p_user_id": user_id}).execute(),
+    )
+    return {row["status"]: int(row["count"]) for row in (response.data or [])}
+
+
+def find_active_incident_by_fingerprint(user_id: str, fingerprint: str, window_hours: int) -> Optional[Dict[str, Any]]:
+    """Return the most recent still-active incident with this fingerprint inside the grouping window."""
+    if window_hours <= 0:
         return None
+    since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    response = _run(
+        "find_active_incident_by_fingerprint",
+        lambda: get_supabase()
+        .table(T_INCIDENTS)
+        .select("id,status,occurrence_count")
+        .eq("user_id", user_id)
+        .eq("fingerprint", fingerprint)
+        .in_("status", list(ACTIVE_INCIDENT_STATUSES))
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
 
 
-def store_github_token(token_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def record_occurrence(incident_id: str, user_id: str, seen_at: str) -> int:
+    """Atomically increment ``occurrence_count`` (RPC) and return the new value."""
+    response = _run(
+        "record_occurrence",
+        lambda: get_supabase()
+        .rpc(
+            "increment_incident_occurrence",
+            {"p_incident_id": incident_id, "p_user_id": user_id, "p_seen_at": seen_at},
+        )
+        .execute(),
+    )
+    data = response.data
+    if isinstance(data, list):
+        data = data[0] if data else 0
+    return int(data or 0)
+
+
+def delete_incident(incident_id: str, user_id: str) -> bool:
+    response = _run(
+        "delete_incident",
+        lambda: get_supabase().table(T_INCIDENTS).delete().eq("id", incident_id).eq("user_id", user_id).execute(),
+    )
+    return bool(response.data)
+
+
+def list_stale_incidents(status: str, older_than_minutes: int, limit: int = 50) -> List[Dict[str, Any]]:
+    """Incidents stuck in *status* since before the cut-off (worker maintenance)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
+    response = _run(
+        "list_stale_incidents",
+        lambda: get_supabase()
+        .table(T_INCIDENTS)
+        .select("id,user_id,status,attempts,updated_at")
+        .eq("status", status)
+        .lt("updated_at", cutoff)
+        .order("updated_at")
+        .limit(limit)
+        .execute(),
+    )
+    return response.data or []
+
+
+# ================================================================== #
+# Analyses / fixes                                                     #
+# ================================================================== #
+
+def get_latest_fix(incident_id: str) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "get_latest_fix",
+        lambda: get_supabase()
+        .table(T_FIXES)
+        .select("*")
+        .eq("incident_id", incident_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
+
+
+def save_fix(incident_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Upsert a GitHub OAuth token for a user.
-
-    Uses ``on_conflict="user_id"`` so that re-authorising overwrites the
-    existing token rather than creating a duplicate row.
-
-    Args:
-        token_data: Column-value dict matching the github_tokens schema.
-            Must include ``user_id``.  The ``access_token`` value must be
-            the raw string (not SecretStr) — the schema layer is responsible
-            for calling ``.get_secret_value()`` before calling this function.
-
-    Returns:
-        The upserted row as a dict, or ``None`` on failure.
+    Store the analysis result for an incident.  One row per incident: the
+    latest row is updated when it exists (re-analysis), otherwise inserted.
     """
-    user_id = token_data.get("user_id", "<unknown>")
-
-    try:
-        client = get_supabase()
-        response = (
-            client.table(_T_GITHUB_TOKENS)
-            .upsert(token_data, on_conflict="user_id")
-            .execute()
+    existing = get_latest_fix(incident_id)
+    payload = {**data, "incident_id": incident_id}
+    if existing:
+        response = _run(
+            "save_fix(update)",
+            lambda: get_supabase().table(T_FIXES).update(payload).eq("id", existing["id"]).execute(),
         )
+    else:
+        response = _run("save_fix(insert)", lambda: get_supabase().table(T_FIXES).insert(payload).execute())
+    row = _first(response.data)
+    if row is None:
+        raise DatabaseError("save_fix returned no row.")
+    return row
 
-        rows: List[Dict[str, Any]] = response.data or []
-        if not rows:
-            logger.error(
-                "store_github_token: upsert returned empty data for user_id=%s.",
-                user_id,
-            )
-            return None
 
-        upserted = rows[0]
-        logger.debug(
-            "store_github_token: token upserted for user_id=%s, github_username=%s.",
-            user_id,
-            upserted.get("github_username"),
+def update_fix(fix_id: str, data: Dict[str, Any]) -> None:
+    _run("update_fix", lambda: get_supabase().table(T_FIXES).update(data).eq("id", fix_id).execute())
+
+
+def delete_fixes_for_incident(incident_id: str) -> None:
+    _run("delete_fixes", lambda: get_supabase().table(T_FIXES).delete().eq("incident_id", incident_id).execute())
+
+
+# ================================================================== #
+# Pull requests                                                        #
+# ================================================================== #
+
+def create_pull_request_record(data: Dict[str, Any]) -> Dict[str, Any]:
+    response = _run("create_pull_request_record", lambda: get_supabase().table(T_PULL_REQUESTS).insert(data).execute())
+    row = _first(response.data)
+    if row is None:
+        raise DatabaseError("create_pull_request_record returned no row.")
+    return row
+
+
+def get_pull_request_for_incident(incident_id: str) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "get_pull_request_for_incident",
+        lambda: get_supabase()
+        .table(T_PULL_REQUESTS)
+        .select("*")
+        .eq("incident_id", incident_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
+
+
+def link_pull_request_to_fix(incident_id: str, fix_id: str) -> None:
+    """Attach the incident's PR record(s) to its analysis row."""
+    _run(
+        "link_pull_request_to_fix",
+        lambda: get_supabase()
+        .table(T_PULL_REQUESTS)
+        .update({"fix_id": fix_id})
+        .eq("incident_id", incident_id)
+        .is_("fix_id", "null")
+        .execute(),
+    )
+
+
+def update_pull_request(pr_id: str, data: Dict[str, Any]) -> None:
+    _run("update_pull_request", lambda: get_supabase().table(T_PULL_REQUESTS).update(data).eq("id", pr_id).execute())
+
+
+def list_open_pull_requests(limit: int = 200) -> List[Dict[str, Any]]:
+    """Open PRs joined with their incident owner, oldest-synced first."""
+    response = _run(
+        "list_open_pull_requests",
+        lambda: get_supabase()
+        .table(T_PULL_REQUESTS)
+        .select("id,incident_id,pr_number,repo_full_name,status,last_synced_at,incidents!inner(user_id,status)")
+        .eq("status", "open")
+        .order("last_synced_at", desc=False, nullsfirst=True)
+        .limit(limit)
+        .execute(),
+    )
+    return response.data or []
+
+
+# ================================================================== #
+# Pipeline steps (agent timeline)                                      #
+# ================================================================== #
+
+def add_step(data: Dict[str, Any]) -> None:
+    _run("add_step", lambda: get_supabase().table(T_STEPS).insert(data).execute())
+
+
+def list_steps(incident_id: str, run: Optional[int] = None) -> List[Dict[str, Any]]:
+    def _query():
+        query = (
+            get_supabase()
+            .table(T_STEPS)
+            .select("id,run,step,kind,status,summary,detail,provider,model,duration_ms,input_tokens,output_tokens,created_at")
+            .eq("incident_id", incident_id)
         )
-        return upserted
+        if run is not None:
+            query = query.eq("run", run)
+        return query.order("created_at").limit(200).execute()
 
-    except Exception as exc:
-        logger.error(
-            "DB error in store_github_token (user_id=%s): %s — %s.",
-            user_id,
-            type(exc).__name__,
-            exc,
+    return _run("list_steps", _query).data or []
+
+
+def delete_steps(incident_id: str) -> None:
+    _run("delete_steps", lambda: get_supabase().table(T_STEPS).delete().eq("incident_id", incident_id).execute())
+
+
+# ================================================================== #
+# API keys                                                             #
+# ================================================================== #
+
+def insert_api_key(user_id: str, hashed_key: str, key_prefix: str, name: str) -> Dict[str, Any]:
+    response = _run(
+        "insert_api_key",
+        lambda: get_supabase()
+        .table(T_API_KEYS)
+        .insert({"user_id": user_id, "api_key": hashed_key, "key_prefix": key_prefix, "name": name})
+        .execute(),
+    )
+    row = _first(response.data)
+    if row is None:
+        raise DatabaseError("insert_api_key returned no row.")
+    return row
+
+
+def list_api_keys(user_id: str) -> List[Dict[str, Any]]:
+    response = _run(
+        "list_api_keys",
+        lambda: get_supabase()
+        .table(T_API_KEYS)
+        .select("id,name,key_prefix,is_active,created_at,last_used_at,revoked_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute(),
+    )
+    return response.data or []
+
+
+def count_active_api_keys(user_id: str) -> int:
+    response = _run(
+        "count_active_api_keys",
+        lambda: get_supabase()
+        .table(T_API_KEYS)
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute(),
+    )
+    return response.count or 0
+
+
+def revoke_api_key(user_id: str, key_id: str) -> bool:
+    response = _run(
+        "revoke_api_key",
+        lambda: get_supabase()
+        .table(T_API_KEYS)
+        .update({"is_active": False, "revoked_at": utcnow()})
+        .eq("id", key_id)
+        .eq("user_id", user_id)
+        .execute(),
+    )
+    return bool(response.data)
+
+
+def find_api_key(hashed_key: str) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "find_api_key",
+        lambda: get_supabase()
+        .table(T_API_KEYS)
+        .select("id,user_id,is_active")
+        .eq("api_key", hashed_key)
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
+
+
+def touch_api_key(key_id: str) -> None:
+    _run("touch_api_key", lambda: get_supabase().table(T_API_KEYS).update({"last_used_at": utcnow()}).eq("id", key_id).execute())
+
+
+# ================================================================== #
+# GitHub connection                                                    #
+# ================================================================== #
+
+def get_github_row(user_id: str) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "get_github_row",
+        lambda: get_supabase()
+        .table(T_GITHUB_TOKENS)
+        .select("user_id,access_token,github_username,github_user_id,scopes,repo_name,branch_name,created_at,updated_at")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
+
+
+def upsert_github_row(data: Dict[str, Any]) -> None:
+    _run("upsert_github_row", lambda: get_supabase().table(T_GITHUB_TOKENS).upsert(data, on_conflict="user_id").execute())
+
+
+def update_github_row(user_id: str, data: Dict[str, Any]) -> None:
+    _run("update_github_row", lambda: get_supabase().table(T_GITHUB_TOKENS).update(data).eq("user_id", user_id).execute())
+
+
+def delete_github_row(user_id: str) -> None:
+    _run("delete_github_row", lambda: get_supabase().table(T_GITHUB_TOKENS).delete().eq("user_id", user_id).execute())
+
+
+# ================================================================== #
+# Repository mappings (Sentry project → GitHub repo)                   #
+# ================================================================== #
+
+def list_repo_mappings(user_id: str) -> List[Dict[str, Any]]:
+    response = _run(
+        "list_repo_mappings",
+        lambda: get_supabase()
+        .table(T_REPO_MAPPINGS)
+        .select("id,sentry_project,repo_full_name,branch,created_at,updated_at")
+        .eq("user_id", user_id)
+        .order("created_at")
+        .execute(),
+    )
+    return response.data or []
+
+
+def get_default_mapping(user_id: str) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "get_default_mapping",
+        lambda: get_supabase()
+        .table(T_REPO_MAPPINGS)
+        .select("id,sentry_project,repo_full_name,branch")
+        .eq("user_id", user_id)
+        .is_("sentry_project", "null")
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
+
+
+def get_mapping_for_project(user_id: str, sentry_project: str) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "get_mapping_for_project",
+        lambda: get_supabase()
+        .table(T_REPO_MAPPINGS)
+        .select("id,sentry_project,repo_full_name,branch")
+        .eq("user_id", user_id)
+        .eq("sentry_project", sentry_project)
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
+
+
+def resolve_repo_mapping(user_id: str, sentry_project: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Project-specific mapping first, then the user's default repository."""
+    if sentry_project:
+        mapping = get_mapping_for_project(user_id, sentry_project)
+        if mapping:
+            return mapping
+    return get_default_mapping(user_id)
+
+
+def save_repo_mapping(user_id: str, sentry_project: Optional[str], repo_full_name: str, branch: Optional[str]) -> Dict[str, Any]:
+    """Create or update the mapping for (user, sentry_project)."""
+    existing = get_mapping_for_project(user_id, sentry_project) if sentry_project else get_default_mapping(user_id)
+    payload = {"repo_full_name": repo_full_name, "branch": branch}
+    if existing:
+        response = _run(
+            "save_repo_mapping(update)",
+            lambda: get_supabase().table(T_REPO_MAPPINGS).update(payload).eq("id", existing["id"]).execute(),
         )
-        return None
+    else:
+        response = _run(
+            "save_repo_mapping(insert)",
+            lambda: get_supabase()
+            .table(T_REPO_MAPPINGS)
+            .insert({**payload, "user_id": user_id, "sentry_project": sentry_project})
+            .execute(),
+        )
+    row = _first(response.data)
+    if row is None:
+        raise DatabaseError("save_repo_mapping returned no row.")
+    return row
 
 
-# ------------------------------------------------------------------ #
-# Internal helpers                                                     #
-# ------------------------------------------------------------------ #
+def delete_repo_mapping(user_id: str, mapping_id: str) -> bool:
+    response = _run(
+        "delete_repo_mapping",
+        lambda: get_supabase().table(T_REPO_MAPPINGS).delete().eq("id", mapping_id).eq("user_id", user_id).execute(),
+    )
+    return bool(response.data)
 
-def _safe_repr(data: Dict[str, Any]) -> str:
-    """Return a log-safe summary of *data* (keys only, no values)."""
-    return f"{{keys: {list(data.keys())}}}"
+
+# ================================================================== #
+# Sentry integration                                                   #
+# ================================================================== #
+
+def get_sentry_integration(user_id: str) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "get_sentry_integration",
+        lambda: get_supabase()
+        .table(T_SENTRY)
+        .select("user_id,org_slug,base_url,auth_token_enc,webhook_secret_enc,updated_at")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute(),
+    )
+    return _first(response.data)
+
+
+def upsert_sentry_integration(data: Dict[str, Any]) -> None:
+    _run("upsert_sentry_integration", lambda: get_supabase().table(T_SENTRY).upsert(data, on_conflict="user_id").execute())
+
+
+def delete_sentry_integration(user_id: str) -> None:
+    _run("delete_sentry_integration", lambda: get_supabase().table(T_SENTRY).delete().eq("user_id", user_id).execute())
+
+
+# ================================================================== #
+# Profiles & account                                                   #
+# ================================================================== #
+
+def get_profile(user_id: str) -> Optional[Dict[str, Any]]:
+    response = _run(
+        "get_profile",
+        lambda: get_supabase().table(T_PROFILES).select("user_id,full_name").eq("user_id", user_id).limit(1).execute(),
+    )
+    return _first(response.data)
+
+
+def upsert_profile(user_id: str, full_name: str) -> None:
+    _run(
+        "upsert_profile",
+        lambda: get_supabase().table(T_PROFILES).upsert({"user_id": user_id, "full_name": full_name}, on_conflict="user_id").execute(),
+    )
+
+
+def delete_user_data(user_id: str) -> None:
+    """
+    Delete every row owned by *user_id*.  Child rows (fixes, pull requests,
+    pipeline steps) cascade from incidents; tables keyed directly by user
+    are cleared explicitly so deletion does not depend on FK configuration.
+    """
+    client = get_supabase()
+    incident_ids = [
+        row["id"]
+        for row in (_run("delete_user_data(select)", lambda: client.table(T_INCIDENTS).select("id").eq("user_id", user_id).execute()).data or [])
+    ]
+    for chunk in _chunks(incident_ids, 200):
+        _run("delete_user_data(pull_requests)", lambda c=chunk: client.table(T_PULL_REQUESTS).delete().in_("incident_id", c).execute())
+        _run("delete_user_data(fixes)", lambda c=chunk: client.table(T_FIXES).delete().in_("incident_id", c).execute())
+        _run("delete_user_data(steps)", lambda c=chunk: client.table(T_STEPS).delete().in_("incident_id", c).execute())
+    for table in (T_INCIDENTS, T_API_KEYS, T_REPO_MAPPINGS, T_SENTRY, T_GITHUB_TOKENS, T_PROFILES):
+        _run(f"delete_user_data({table})", lambda t=table: client.table(t).delete().eq("user_id", user_id).execute())
+
+
+def delete_auth_user(user_id: str) -> None:
+    _run("delete_auth_user", lambda: get_supabase().auth.admin.delete_user(user_id))
+
+
+def _chunks(items: List[str], size: int) -> Iterable[List[str]]:
+    for index in range(0, len(items), size):
+        yield items[index : index + size]

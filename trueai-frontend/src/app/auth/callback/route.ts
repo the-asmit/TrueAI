@@ -1,44 +1,43 @@
-import { createServerClient } from '@supabase/ssr'
-import { cookies } from 'next/headers'
+import type { EmailOtpType } from '@supabase/supabase-js'
 import { NextResponse, type NextRequest } from 'next/server'
 
+import { safeNextPath } from '@/lib/redirect'
+import { createClient } from '@/lib/supabase/server'
+
+/**
+ * Completes Supabase email links:
+ *   - sign-up confirmation     → /onboarding
+ *   - password recovery        → /reset-password
+ *   - magic link / email change → ?next= (validated) or /dashboard
+ * Both link styles are supported: ?token_hash=&type= and PKCE ?code=.
+ */
 export async function GET(request: NextRequest) {
-  const { searchParams, origin } = new URL(request.url)
+  const { searchParams, origin } = request.nextUrl
   const code = searchParams.get('code')
-  const token_hash = searchParams.get('token_hash')
-  const type = searchParams.get('type')
+  const tokenHash = searchParams.get('token_hash')
+  const type = searchParams.get('type') as EmailOtpType | null
+  const next = searchParams.get('next')
 
-  const cookieStore = await cookies()
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return cookieStore.getAll()
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) =>
-            cookieStore.set(name, value, options)
-          )
-        },
-      },
-    }
-  )
+  const supabase = await createClient()
+  let error: string | null = null
 
-  if (token_hash && type) {
-    const { error } = await supabase.auth.verifyOtp({ token_hash, type: type as any })
-    if (!error) {
-      return NextResponse.redirect(`${origin}/onboarding`)
-    }
+  if (tokenHash && type) {
+    const result = await supabase.auth.verifyOtp({ token_hash: tokenHash, type })
+    error = result.error?.message ?? null
+  } else if (code) {
+    const result = await supabase.auth.exchangeCodeForSession(code)
+    error = result.error?.message ?? null
+  } else {
+    error = 'The link is missing its verification code.'
   }
 
-  if (code) {
-    const { error } = await supabase.auth.exchangeCodeForSession(code)
-    if (!error) {
-      return NextResponse.redirect(`${origin}/onboarding`)
-    }
+  if (error) {
+    const failure = new URL('/login', origin)
+    failure.searchParams.set('error', 'link_invalid')
+    return NextResponse.redirect(failure)
   }
 
-  return NextResponse.redirect(`${origin}/login`)
+  if (type === 'recovery') return NextResponse.redirect(new URL('/reset-password', origin))
+  if (type === 'signup' || type === 'invite') return NextResponse.redirect(new URL('/onboarding', origin))
+  return NextResponse.redirect(new URL(safeNextPath(next), origin))
 }

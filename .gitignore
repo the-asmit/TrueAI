@@ -1,54 +1,68 @@
-# Python
+# ─────────────────────────────────────────────────────────────────────
+# TrueAI: only project files are committed. Everything below is local,
+# generated, or secret. The dashboard has its own trueai-frontend/.gitignore.
+# ─────────────────────────────────────────────────────────────────────
+
+# ---- Secrets and local configuration --------------------------------
+.env
+.env.*
+!.env.example
+
+# ---- Python ----------------------------------------------------------
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.egg-info/
 .eggs/
 dist/
 build/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
-# Virtual environments
-venv/
+# ---- Virtual environments --------------------------------------------
 myenv/
+venv/
 .venv/
 env/
 
-# Environment variables
-.env
-.env.*
-
-# Logs
-logs/*.log
+# ---- Runtime output (the app creates logs/ itself) ------------------
+logs/
 *.log
+dump.rdb
+# Celery beat writes its schedule as several files (e.g. .dat/.dir/.bak on Windows).
+celerybeat-schedule*
+celerybeat.pid
 
-# OS
-.DS_Store
-Thumbs.db
+# ---- Supabase CLI local state (the migrations and config.toml are committed) ----
+supabase/.temp/
+supabase/.branches/
 
-# IDE
+# ---- Documentation: only the READMEs are part of the repository -------
+# (keeps personal notes, design-tool and AI-assistant files such as
+#  DESIGN.md, PRODUCT.md, AGENTS.md or CLAUDE.md out of commits)
+*.md
+!README.md
+
+# ---- Local tools -----------------------------------------------------
+graphify-out/
+graphify.bat
+graph.json
+graph.html
+.graphifyignore
+.agents/
+.claude/
+.cursor/
+.impeccable/
+.stitch/
+*.bat
+
+# ---- Editors and OS --------------------------------------------------
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Graphify
-graphify-out/
-graph.json
-graph.html
-GRAPH_REPORT.md
-.agents
-.graphifyignore
-graphify.bat
-
-# Redis dump
-dump.rdb
-
-# Celery
-celerybeat-schedule
-celerybeat.pid
-
-# Test cache
-.pytest_cache/
-.coverage
-htmlcov/
+.DS_Store
+Thumbs.db

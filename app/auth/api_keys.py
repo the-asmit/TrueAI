@@ -1,151 +1,78 @@
 """
-API key generation, hashing, and verification for TrueAI.
+API key generation, hashing and lookup for TrueAI.
 
 Security model
 ──────────────
-Raw keys are generated with ``secrets.token_urlsafe(32)`` which yields
-~43 characters of URL-safe Base64, providing ~192 bits of entropy.
-
-Keys are hashed with HMAC-SHA256 keyed on ``API_KEY_SECRET`` before storage.
-Using HMAC rather than plain SHA256 means that even if the ``api_keys`` table
-is leaked, an attacker cannot brute-force the raw keys offline — they would
-also need to know the server secret.
-
-The raw key is returned to the caller exactly once (at generation time) and
-is never stored, logged, or retained anywhere in the system.  All subsequent
-operations work exclusively with the HMAC-SHA256 digest.
-
-Comparison is always performed with ``hmac.compare_digest`` to prevent
-timing-based side-channel attacks.
+- Raw keys are ``tai_`` + 32 random bytes (``secrets.token_urlsafe``), ~256
+  bits of entropy.  The raw key is shown to the user exactly once.
+- Only an HMAC-SHA256 digest keyed on ``API_KEY_SECRET`` is stored, so a
+  leaked ``api_keys`` table cannot be brute-forced without the server secret.
+  (Rotating ``API_KEY_SECRET`` invalidates every existing key.)
+- Keys are looked up by digest, so comparison happens inside the database's
+  unique index — there is no string comparison to time.
+- ``last_used_at`` is updated at most once every 5 minutes per key.
 """
+
+from __future__ import annotations
 
 import hashlib
 import hmac
 import secrets
-from typing import Tuple
+from typing import Optional, Tuple
 
 from app.core.config import settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Encoding used consistently for all encode/decode operations.
-_ENCODING: str = "utf-8"
-
-# Prefix embedded in every raw key so support teams can identify TrueAI keys
-# in credential scanners without needing to call the API.
-_KEY_PREFIX: str = "tai_"
+KEY_PREFIX = "tai_"
+_DISPLAY_PREFIX_LENGTH = 12
+_TOUCH_INTERVAL_SECONDS = 300
 
 
-# ------------------------------------------------------------------ #
-# Public API                                                           #
-# ------------------------------------------------------------------ #
-
-def generate_api_key() -> Tuple[str, str]:
-    """
-    Generate a new API key and return it as a ``(raw_key, hashed_key)`` tuple.
-
-    The raw key must be shown to the user **immediately and exactly once**.
-    Only the hashed key should be persisted to the database.
-
-    Returns:
-        A 2-tuple of ``(raw_key, hashed_key)`` where:
-
-        - ``raw_key``    — the human-visible key string (``tai_<43 chars>``).
-          Never store or log this value.
-        - ``hashed_key`` — the HMAC-SHA256 hex digest safe to store in DB.
-
-    Example::
-
-        raw_key, hashed_key = generate_api_key()
-        # Show raw_key to user once, save hashed_key to DB.
-    """
-    raw_key = _KEY_PREFIX + secrets.token_urlsafe(32)
-    hashed_key = hash_api_key(raw_key)
-
-    # Log only that a key was generated — NEVER the key itself.
-    logger.debug("New API key generated (hash prefix: %s...).", hashed_key[:8])
-
-    return raw_key, hashed_key
+def generate_api_key() -> Tuple[str, str, str]:
+    """Return ``(raw_key, hashed_key, display_prefix)``."""
+    raw_key = KEY_PREFIX + secrets.token_urlsafe(32)
+    return raw_key, hash_api_key(raw_key), raw_key[:_DISPLAY_PREFIX_LENGTH]
 
 
 def hash_api_key(raw_key: str) -> str:
-    """
-    Return the HMAC-SHA256 hex digest of *raw_key* keyed on ``API_KEY_SECRET``.
-
-    Deterministic: the same raw key always produces the same digest, so the
-    result can be used as a lookup key in the database.
-
-    Args:
-        raw_key: The raw API key string exactly as issued to the user.
-
-    Returns:
-        A 64-character lowercase hex string.
-
-    Raises:
-        ValueError: If *raw_key* is empty or whitespace-only.
-    """
     if not raw_key or not raw_key.strip():
         raise ValueError("raw_key must not be empty.")
-
-    secret = settings.API_KEY_SECRET.encode(_ENCODING)
-    message = raw_key.encode(_ENCODING)
-
-    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+    secret = (settings.secret("API_KEY_SECRET") or "").encode("utf-8")
+    return hmac.new(secret, raw_key.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def verify_api_key(raw_key: str, stored_hash: str) -> bool:
+def looks_like_api_key(value: Optional[str]) -> bool:
+    return bool(value) and value.startswith(KEY_PREFIX) and 20 <= len(value) <= 128  # type: ignore[union-attr]
+
+
+def resolve_api_key(raw_key: str) -> Optional[str]:
     """
-    Verify that *raw_key* corresponds to *stored_hash* in constant time.
+    Return the owning ``user_id`` for an active key, or None.
 
-    Uses ``hmac.compare_digest`` to prevent timing-based side-channel attacks.
-    The function re-derives the HMAC of *raw_key* and compares it against
-    *stored_hash* — both strings must be equal in length and content for
-    ``True`` to be returned.
-
-    Args:
-        raw_key:     The raw API key presented by the caller.
-        stored_hash: The HMAC-SHA256 hex digest retrieved from the database.
-
-    Returns:
-        ``True`` if the key is valid, ``False`` otherwise.
-
-    Note:
-        This function **never raises** on bad input — it returns ``False``
-        and logs a warning.  Raising would allow callers to distinguish
-        between "wrong key" and "malformed key", which is information leakage.
+    Raises DatabaseError when the lookup itself fails so callers can answer
+    503 instead of wrongly reporting the key as invalid.
     """
-    if not raw_key or not stored_hash:
-        logger.warning("verify_api_key called with empty raw_key or stored_hash.")
-        return False
+    if not looks_like_api_key(raw_key):
+        return None
+    from app.services import redis as redis_svc
+    from app.services import supabase as db
 
-    try:
-        computed_hash = hash_api_key(raw_key)
-    except ValueError:
-        logger.warning("verify_api_key: hash_api_key raised ValueError (empty key).")
-        return False
+    row = db.find_api_key(hash_api_key(raw_key))
+    if not row or row.get("is_active") is False:
+        return None
+    if redis_svc.claim_once(f"apikey-touch:{row['id']}", _TOUCH_INTERVAL_SECONDS) is not False:
+        try:
+            db.touch_api_key(row["id"])
+        except Exception as exc:  # usage tracking must never block authentication
+            logger.debug("Could not update last_used_at: %s", exc)
+    return str(row["user_id"])
 
-    # hmac.compare_digest requires both arguments to be the same type.
-    # hash_api_key always returns str (hex digits), so stored_hash must also
-    # be str.  Guard against bytes leaking in from the DB layer.
-    if isinstance(stored_hash, bytes):
-        stored_hash = stored_hash.decode(_ENCODING)
 
-    return hmac.compare_digest(computed_hash, stored_hash)
+def webhook_url_for(raw_key: str) -> str:
+    return f"{settings.BASE_URL}/webhook/sentry?key={raw_key}"
 
 
 def mask_key_for_logging(raw_key: str) -> str:
-    """
-    Return a safely truncated representation of *raw_key* for log messages.
-
-    Shows only the prefix (``tai_``) and the first 4 characters of the random
-    portion, then masks the rest.  Provides just enough context to correlate
-    log lines with a specific key without exposing the secret.
-
-    Example: ``"tai_AbCd...****************"``
-    """
-    if len(raw_key) <= len(_KEY_PREFIX) + 4:
-        return f"{_KEY_PREFIX}****"
-    visible = raw_key[: len(_KEY_PREFIX) + 4]
-    masked_len = len(raw_key) - len(visible)
-    return f"{visible}{'*' * masked_len}"
+    return f"{raw_key[:8]}…" if raw_key else "(none)"

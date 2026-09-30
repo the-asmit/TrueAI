@@ -1,490 +1,296 @@
 """
-Context enrichment node — fetches relevant source files from GitHub.
+Context node — gathers the source code the agents reason about (a tool, not an agent).
 
-Strategy:
-    - Reverse the stack frames (last = closest to crash = highest priority).
-    - Deduplicate by filename.
-    - Fetch up to MAX_FILES (5) files.
-    - For each file, slice a ±CONTEXT_WINDOW (30) line window around the
-      error line so the LLM receives focused context, not entire files.
-    - Handle each frame independently: file not found, rate limit, wrong
-      path → log WARNING/ERROR, skip, continue.  A single frame failure
-      never aborts the enrichment pass.
-    - If EVERY frame fails → set error, status = "failed", return full state.
+Reads:
+    user_id, event, pending_file_requests, repo, source_files, code_context
 
-All GitHub / Supabase calls are run via asyncio.to_thread() because the
-underlying libraries (PyGithub, supabase-py) are synchronous.  Running them
-directly in an async function would block the event loop.
+Writes:
+    repo, repo_note, can_push, source_files, code_context, pending_file_requests
+    (GitHub outage) status = "failed", error, error_retryable
+
+First call:
+    1. Pick the repository for this incident: the mapping for its Sentry
+       project, else the user's default repository.
+    2. Pin the target branch to a commit SHA (every later read and the PR
+       itself use this exact commit).
+    3. Map in-app stack frames to repository files (innermost first) and read
+       them, keeping full contents for editing and numbered excerpts for
+       prompts: the file header (imports) plus a window around each frame line.
+
+Follow-up calls (the Investigator asked for more files):
+    Resolve and read only the requested paths.
+
+No repository / no GitHub connection is not fatal — the analysis continues
+on Sentry data alone and the incident is flagged instead of getting a PR.
 """
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from fastapi import HTTPException
-
+from app.core.config import settings
+from app.core.errors import GitHubError
 from app.core.logging import get_logger
-from app.core.state import IncidentState
-from app.services.github.client import get_file_content
+from app.core.state import IncidentState, failure
+from app.pipelines.timeline import plural, record_step, set_current_step
+from app.services import supabase as db
+from app.services.github.client import load_connection
+from app.services.github.fetcher import (
+    RepoSnapshot,
+    SourceFile,
+    frame_path_candidates,
+    normalize_path,
+    open_snapshot,
+    read_file,
+    resolve_path,
+)
 
 logger = get_logger(__name__)
 
-MAX_FILES: int = 5
-CONTEXT_WINDOW: int = 30   # lines above and below the error line
+_HEAD_LINES = 20           # file header shown with every excerpt (imports, constants)
+_FULL_FILE_MAX_LINES = 160  # smaller files are shown whole
 
 
-async def context_node(state: IncidentState) -> IncidentState:
-    """
-    Fetch GitHub source files for each user-code stack frame.
+async def context_node(state: IncidentState) -> Dict[str, Any]:
+    if state.get("pending_file_requests") and state.get("repo"):
+        return await _fetch_requested(state)
+    return await _initial_context(state)
 
-    Reads:
-        user_id, stack_frames
 
-    Writes:
-        github_context  →  Dict[filename, content_window]
-        status = "failed" + error  if ALL frames fail
+# ================================================================== #
+# First pass — stack frames                                            #
+# ================================================================== #
 
-    On partial failure (some frames succeed, some fail): continues with
-    whatever was fetched — never sets status="failed" for a partial result.
-    """
-    state = {**state}
+async def _initial_context(state: IncidentState) -> Dict[str, Any]:
     incident_id = state.get("incident_id", "unknown")
-    user_id: str = state.get("user_id", "")
-    stack_frames: List[Dict[str, Any]] = state.get("stack_frames") or []
-    logger.debug(
-        "context_node ENTRY | incident_id=%s | frame_count=%d",
-        incident_id,
-        len(stack_frames),
-    )
+    user_id = state["user_id"]
+    event = state.get("event") or {}
+    started = time.perf_counter()
+    await set_current_step(state, "Reading source code from GitHub")
+
+    mapping = await asyncio.to_thread(db.resolve_repo_mapping, user_id, event.get("project"))
+    connection = await asyncio.to_thread(load_connection, user_id)
+    if connection is None or mapping is None:
+        note = (
+            "GitHub is not connected (or the stored token is no longer valid)."
+            if connection is None
+            else "No repository is configured for this Sentry project."
+        )
+        await record_step(state, step="context", kind="tool", status="warning", summary=f"{note} Continuing without source code.")
+        return {"repo": None, "repo_note": note, "can_push": False, "source_files": {}, "code_context": {}}
 
     try:
-        if not stack_frames:
-            logger.warning(
-                "context_node: no stack_frames in state — skipping GitHub fetch | "
-                "incident_id=%s",
-                incident_id,
-            )
-            state["github_context"] = {}
-            return state
-
-        # ---- Fetch GitHub credentials -------------------------------- #
-        access_token, repo_full_name = await _get_github_credentials(user_id)
-
-        if not access_token or not repo_full_name:
-            state["error"] = (
-                f"No GitHub token or repository configured for user_id={user_id!r}. "
-                "Connect a GitHub account and set a default repository."
-            )
-            state["status"] = "failed"
-            logger.error(
-                "context_node: missing GitHub credentials | "
-                "incident_id=%s | user_id=%s | has_token=%s | has_repo=%s",
-                incident_id,
-                user_id,
-                bool(access_token),
-                bool(repo_full_name),
-            )
-            return state
-
-        # ---- Build prioritised file list ----------------------------- #
-        # Reverse so that the innermost (crash-closest) frames are first.
-        files_to_fetch: List[Tuple[str, int]] = _prioritise_frames(stack_frames)
-
-        # ---- Fetch each file independently --------------------------- #
-        github_context: Dict[str, str] = {}
-        fetch_errors: int = 0
-
-        for file_path, lineno in files_to_fetch:
-            if len(github_context) >= MAX_FILES:
-                break
-
-            content = await _fetch_file_window(
-                access_token=access_token,
-                repo_full_name=repo_full_name,
-                file_path=file_path,
-                lineno=lineno,
-                incident_id=incident_id,
-            )
-
-            if content is not None:
-                github_context[file_path] = content
-            else:
-                fetch_errors += 1
-
-        # ---- Evaluate result ---------------------------------------- #
-        if not github_context and fetch_errors > 0:
-            logger.warning(
-                "context_node: ALL file fetches failed | incident_id=%s | "
-                "repo=%s | attempted=%d — continuing with empty context",
-                incident_id,
-                repo_full_name,
-                fetch_errors,
-            )
-            state["github_context"] = {}
-            return state
-
-        state["github_context"] = github_context
-
-        logger.debug(
-            "context_node EXIT | incident_id=%s | files_fetched=%d | "
-            "files_failed=%d",
-            incident_id,
-            len(github_context),
-            fetch_errors,
+        snapshot = await asyncio.to_thread(
+            open_snapshot, connection.token, mapping["repo_full_name"], mapping.get("branch")
         )
-        return state
+    except GitHubError as exc:
+        if exc.retryable:
+            await record_step(state, step="context", kind="tool", status="error", summary=str(exc))
+            return failure(f"GitHub is temporarily unavailable: {exc}", retryable=True)
+        note = f"Could not open {mapping['repo_full_name']}: {exc}"
+        await record_step(state, step="context", kind="tool", status="warning", summary=f"{note} Continuing without source code.")
+        return {"repo": None, "repo_note": note, "can_push": False, "source_files": {}, "code_context": {}}
 
-    except Exception as exc:
-        state["error"] = (
-            f"context_node unhandled exception: {type(exc).__name__}: {exc}"
-        )
-        state["status"] = "failed"
-        logger.error(
-            "context_node EXCEPTION | incident_id=%s | error=%s",
-            incident_id,
-            exc,
-            exc_info=True,
-        )
-        return state
+    can_push = _can_push(snapshot)
+    frames = event.get("frames") or []
+    targets = _frame_targets(snapshot, frames, event.get("platform"))
 
-
-# ------------------------------------------------------------------ #
-# GitHub credential lookup                                             #
-# ------------------------------------------------------------------ #
-
-async def _get_github_credentials(
-    user_id: str,
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Return (access_token, repo_full_name) for *user_id* from Supabase.
-
-    Uses ``get_github_token()`` (which decrypts Fernet ciphertext) for the
-    token, and a separate Supabase query for the repo_name.  Querying the
-    raw ``access_token`` column directly would return the encrypted bytes
-    and cause GitHub API calls to fail with 401.
-    """
-    try:
-        from app.services.supabase import get_github_token, get_supabase
-
-        # Decrypted token via the service layer (handles Fernet ciphertext).
-        access_token: Optional[str] = await asyncio.to_thread(
-            get_github_token, user_id
-        )
-
-        # Separate query for repo_name (not sensitive, no decryption needed).
-        def _query_repo():
-            client = get_supabase()
-            response = (
-                client.table("github_tokens")
-                .select("repo_name")
-                .eq("user_id", user_id)
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            rows = response.data or []
-            return rows[0].get("repo_name") if rows else None
-
-        repo_full_name: Optional[str] = await asyncio.to_thread(_query_repo)
-
-        return access_token, repo_full_name
-
-    except Exception as exc:
-        logger.error(
-            "context_node: failed to fetch GitHub credentials for "
-            "user_id=%s: %s — %s",
-            user_id,
-            type(exc).__name__,
-            exc,
-        )
-        return None, None
-
-
-
-# ------------------------------------------------------------------ #
-# Frame prioritisation                                                 #
-# ------------------------------------------------------------------ #
-
-def _prioritise_frames(
-    stack_frames: List[Dict[str, Any]],
-) -> List[Tuple[str, int]]:
-    """
-    Return up to MAX_FILES (file_path, lineno) tuples, deduplicated,
-    with crash-closest frames (last in the list) first.
-    """
-    seen: set = set()
-    result: List[Tuple[str, int]] = []
-
-    for frame in reversed(stack_frames):
-        file_path: Optional[str] = frame.get("filename")
-        lineno: int = int(frame.get("lineno") or 1)
-
-        if not file_path:
+    source_files: Dict[str, Dict[str, Any]] = {}
+    code_context: Dict[str, Dict[str, Any]] = {}
+    unresolved = len({f.get("filename") or f.get("abs_path") for f in frames}) - len(targets)
+    for path, focus_lines in targets.items():
+        loaded = await _read(snapshot, path, incident_id)
+        if loaded is None:
             continue
+        source_files[path] = {"content": loaded.content, "mode": loaded.mode}
+        code_context[path] = build_excerpt(loaded, focus_lines, reason="stack trace")
 
-        # Normalise path (strip leading /)
-        file_path = file_path.lstrip("/")
+    summary = (
+        f"{snapshot.repo_full_name}@{snapshot.branch} ({snapshot.sha[:7]}): read {plural(len(code_context), 'file')} from the stack trace"
+    )
+    if frames and not code_context:
+        summary += " — no frame could be matched to a repository file"
+    elif unresolved > 0:
+        summary += f"; {plural(unresolved, 'frame location')} not found in the repository"
+    if not can_push:
+        summary += ". The GitHub token cannot push to this repository, so no PR can be opened"
 
-        if file_path in seen:
-            continue  # already queued
-        seen.add(file_path)
-        result.append((file_path, lineno))
+    await record_step(
+        state,
+        step="context",
+        kind="tool",
+        status="ok" if code_context or not frames else "warning",
+        summary=summary,
+        detail={"files": list(code_context), "sha": snapshot.sha, "tree_complete": snapshot.tree_complete},
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    logger.info("context_node EXIT | incident_id=%s | repo=%s | files=%d", incident_id, snapshot.repo_full_name, len(code_context))
+    return {
+        "repo": snapshot.to_state(),
+        "repo_note": "" if can_push else "The connected GitHub account cannot push to this repository.",
+        "can_push": can_push,
+        "source_files": source_files,
+        "code_context": code_context,
+    }
 
-        if len(result) >= MAX_FILES:
-            break
 
-    return result
+# ================================================================== #
+# Follow-up pass — files requested by the Investigator                 #
+# ================================================================== #
 
-
-# ------------------------------------------------------------------ #
-# File fetch with windowing                                            #
-# ------------------------------------------------------------------ #
-
-async def _fetch_file_window(
-    access_token: str,
-    repo_full_name: str,
-    file_path: str,
-    lineno: int,
-    incident_id: str,
-) -> Optional[str]:
-    """
-    Fetch *file_path* from GitHub and return a ±CONTEXT_WINDOW slice around
-    *lineno*.  Returns None on any error (caller decides whether to skip or
-    fail the pipeline).
-
-    Error handling:
-        HTTPException(404) → file not found → WARNING
-        HTTPException(429) → rate limit → ERROR
-        HTTPException(403) → permission / rate limit → ERROR
-        HTTPException(401) → bad token → ERROR
-        Any other exception → ERROR
-    """
+async def _fetch_requested(state: IncidentState) -> Dict[str, Any]:
+    requested = list(state.get("pending_file_requests") or [])
+    await set_current_step(state, "Fetching files requested by the Investigator")
+    started = time.perf_counter()
     try:
-        raw_content: Optional[str] = await asyncio.to_thread(
-            get_file_content,
-            access_token,
-            repo_full_name,
-            file_path,
-        )
+        update = await load_more_files(state, requested, reason="requested by Investigator")
+    except GitHubError as exc:
+        await record_step(state, step="context", kind="tool", status="warning", summary=f"Could not fetch requested files: {exc}")
+        return {"pending_file_requests": []}
 
-        if raw_content is None:
-            # ---- Fallback: search the repo tree for the file ---------- #
-            resolved_path = await _find_file_in_repo(
-                access_token, repo_full_name, file_path
-            )
-            if resolved_path and resolved_path != file_path:
-                logger.info(
-                    "context_node: resolved '%s' → '%s' via repo tree search | "
-                    "incident_id=%s",
-                    file_path,
-                    resolved_path,
-                    incident_id,
-                )
-                raw_content = await asyncio.to_thread(
-                    get_file_content,
-                    access_token,
-                    repo_full_name,
-                    resolved_path,
-                )
+    added = [p for p in update.get("code_context", {}) if p not in (state.get("code_context") or {})]
+    await record_step(
+        state,
+        step="context",
+        kind="tool",
+        status="ok" if added else "warning",
+        summary=(f"Fetched {plural(len(added), 'requested file')}: {', '.join(added)}" if added else "None of the requested files exist in the repository"),
+        detail={"requested": requested, "fetched": added},
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    return {**update, "pending_file_requests": []}
 
-            if raw_content is None:
-                logger.warning(
-                    "context_node: get_file_content returned None for '%s' in '%s' "
-                    "(including fallback tree search) | incident_id=%s",
-                    file_path,
-                    repo_full_name,
-                    incident_id,
-                )
-                return None
 
-        windowed = _extract_window(raw_content, lineno)
-        logger.debug(
-            "context_node: fetched '%s' (%d chars, window around line %d) | "
-            "incident_id=%s",
-            file_path,
-            len(windowed),
-            lineno,
-            incident_id,
-        )
-        return windowed
+async def load_more_files(state: IncidentState, paths: Iterable[str], *, reason: str) -> Dict[str, Any]:
+    """
+    Read extra files at the pinned commit and return updated
+    ``source_files`` / ``code_context`` dicts.  Shared with the Fix Engineer
+    node (it loads the culprit file when the Investigator named one that
+    was not in the stack trace).
+    """
+    repo = state.get("repo")
+    source_files = dict(state.get("source_files") or {})
+    code_context = dict(state.get("code_context") or {})
+    if not repo:
+        return {"source_files": source_files, "code_context": code_context}
 
-    except HTTPException as http_exc:
-        if http_exc.status_code == 404:
-            logger.warning(
-                "context_node: file '%s' not found in '%s' (404) — skipping | "
-                "incident_id=%s",
-                file_path,
-                repo_full_name,
-                incident_id,
-            )
-        elif http_exc.status_code == 429:
-            logger.error(
-                "context_node: GitHub rate limit hit fetching '%s' from '%s' "
-                "(429) — skipping | incident_id=%s",
-                file_path,
-                repo_full_name,
-                incident_id,
-            )
-        elif http_exc.status_code == 401:
-            logger.error(
-                "context_node: GitHub token invalid or expired fetching '%s' "
-                "from '%s' (401) — skipping | incident_id=%s",
-                file_path,
-                repo_full_name,
-                incident_id,
-            )
+    connection = await asyncio.to_thread(load_connection, state["user_id"])
+    if connection is None:
+        return {"source_files": source_files, "code_context": code_context}
+    snapshot = await asyncio.to_thread(open_snapshot, connection.token, repo["full_name"], repo["branch"], pinned=repo)
+
+    budget = max(0, settings.MAX_CONTEXT_FILES + 3 - len(source_files))
+    for raw in list(paths)[:5]:
+        if budget <= 0:
+            break
+        path_part, _, line_part = (raw or "").partition(":")
+        normalized = normalize_path(path_part)
+        if not normalized:
+            continue
+        resolved = await asyncio.to_thread(resolve_path, snapshot, [normalized])
+        if not resolved or resolved in source_files:
+            continue
+        loaded = await _read(snapshot, resolved, state.get("incident_id", "unknown"))
+        if loaded is None:
+            continue
+        focus = [int(line_part)] if line_part.isdigit() else []
+        source_files[resolved] = {"content": loaded.content, "mode": loaded.mode}
+        code_context[resolved] = build_excerpt(loaded, focus, reason=reason)
+        budget -= 1
+    return {"source_files": source_files, "code_context": code_context}
+
+
+# ================================================================== #
+# Helpers                                                              #
+# ================================================================== #
+
+def _frame_targets(snapshot: RepoSnapshot, frames: List[Dict[str, Any]], platform: Optional[str]) -> Dict[str, List[int]]:
+    """Resolve frames (innermost first) to ``{repo_path: [focus lines]}``, capped at MAX_CONTEXT_FILES."""
+    targets: Dict[str, List[int]] = {}
+    for frame in reversed(frames):
+        path = resolve_path(snapshot, frame_path_candidates(frame, platform))
+        if not path:
+            continue
+        if path not in targets:
+            if len(targets) >= settings.MAX_CONTEXT_FILES:
+                continue
+            targets[path] = []
+        if frame.get("lineno"):
+            targets[path].append(int(frame["lineno"]))
+    return targets
+
+
+async def _read(snapshot: RepoSnapshot, path: str, incident_id: str) -> Optional[SourceFile]:
+    try:
+        return await asyncio.to_thread(read_file, snapshot, path)
+    except GitHubError as exc:
+        logger.warning("context_node: could not read %s | incident_id=%s | error=%s", path, incident_id, exc)
+        return None
+
+
+def _can_push(snapshot: RepoSnapshot) -> bool:
+    try:
+        permissions = snapshot._repo.permissions  # type: ignore[union-attr]
+        return bool(permissions and (permissions.push or permissions.admin))
+    except Exception:
+        return False
+
+
+def build_excerpt(
+    source: SourceFile,
+    focus_lines: List[int],
+    *,
+    reason: str,
+    full_file_max_lines: int = _FULL_FILE_MAX_LINES,
+) -> Dict[str, Any]:
+    """
+    Render a numbered excerpt: the whole file when it is small, otherwise the
+    header plus a ±CONTEXT_WINDOW_LINES window around each focus line (or the
+    first 250 lines when there is no focus line).  Focus lines are marked '>'.
+    """
+    lines = source.content.replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    total = len(lines)
+    focus = {line for line in focus_lines if 1 <= line <= total}
+    window = settings.CONTEXT_WINDOW_LINES
+
+    if total <= full_file_max_lines:
+        ranges = [(1, total)]
+    elif not focus:
+        ranges = [(1, min(total, 250))]
+    else:
+        ranges = [(1, min(_HEAD_LINES, total))] + [(max(1, line - window), min(total, line + window)) for line in sorted(focus)]
+    merged = _merge_ranges(ranges) if total else []
+
+    rendered: List[str] = []
+    previous_end = 0
+    for start, end in merged:
+        if start > previous_end + 1:
+            rendered.append("        ⋮")
+        for number in range(start, end + 1):
+            marker = ">" if number in focus else " "
+            rendered.append(f"{marker}{number:>6} | {lines[number - 1]}")
+        previous_end = end
+    if previous_end < total:
+        rendered.append(f"        ⋮ ({total - previous_end} more lines)")
+
+    return {
+        "excerpt": "\n".join(rendered),
+        "language": source.language,
+        "total_lines": total,
+        "focus_lines": sorted(focus),
+        "reason": reason,
+    }
+
+
+def _merge_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    merged: List[Tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
-            logger.error(
-                "context_node: GitHub API error %d fetching '%s' from '%s' — "
-                "skipping | incident_id=%s | detail=%s",
-                http_exc.status_code,
-                file_path,
-                repo_full_name,
-                incident_id,
-                http_exc.detail,
-            )
-        return None
-
-    except Exception as exc:
-        logger.error(
-            "context_node: unexpected error fetching '%s' from '%s' — "
-            "skipping | incident_id=%s | error=%s — %s",
-            file_path,
-            repo_full_name,
-            incident_id,
-            type(exc).__name__,
-            exc,
-        )
-        return None
-
-
-# ------------------------------------------------------------------ #
-# Repo tree path resolution                                            #
-# ------------------------------------------------------------------ #
-
-async def _find_file_in_repo(
-    access_token: str,
-    repo_full_name: str,
-    file_path: str,
-) -> Optional[str]:
-    """
-    Search the repository's full git tree for a file that matches the
-    basename of *file_path*, returning the best-matching full path.
-
-    Resolution algorithm:
-      1. Fetch the recursive git tree via ``repo.get_git_tree(sha="HEAD",
-         recursive=True)``.
-      2. Extract the basename from *file_path* (e.g. ``main.py`` from
-         ``backend/app/main.py``).
-      3. Collect every blob whose path ends with that basename.
-      4. Zero matches  → return None.
-      5. One match     → return that path directly.
-      6. Many matches  → score each candidate by counting right-to-left
-         path-part overlaps with the original *file_path*, then return the
-         highest-scoring candidate (shorter path wins on ties).
-
-    Args:
-        access_token:   Decrypted GitHub OAuth token.
-        repo_full_name: ``owner/repo`` string.
-        file_path:      The path that failed to resolve directly.
-
-    Returns:
-        A resolved repository-relative path string, or None if no match
-        is found or an error occurs.
-    """
-    def _search_tree() -> Optional[str]:
-        from app.services.github.client import get_repository
-        from github import GithubException
-
-        try:
-            repo = get_repository(access_token, repo_full_name)
-
-            # Fetch the full recursive tree (expensive but cached by GitHub)
-            tree = repo.get_git_tree(sha="HEAD", recursive=True)
-
-            filename = Path(file_path).name  # e.g. "main.py"
-
-            # Collect all blobs whose path ends with the target filename
-            candidates = [
-                element.path
-                for element in tree.tree
-                if element.type == "blob"
-                and element.path.endswith(filename)
-            ]
-
-            if not candidates:
-                return None
-
-            if len(candidates) == 1:
-                return candidates[0]
-
-            # Score candidates by right-to-left path-part overlap
-            original_parts = Path(file_path).parts
-
-            def _overlap_score(candidate: str) -> tuple:
-                candidate_parts = Path(candidate).parts
-                # Count matching parts from the right
-                score = 0
-                for orig, cand in zip(
-                    reversed(original_parts), reversed(candidate_parts)
-                ):
-                    if orig == cand:
-                        score += 1
-                    else:
-                        break
-                # Negate length so shorter paths win on equal score (min depth)
-                return (score, -len(candidate_parts))
-
-            return max(candidates, key=_overlap_score)
-
-        except GithubException as exc:
-            logger.warning(
-                "context_node: git tree fetch failed for '%s' in '%s': %s — %s",
-                file_path,
-                repo_full_name,
-                type(exc).__name__,
-                exc,
-            )
-            return None
-        except Exception as exc:
-            logger.warning(
-                "context_node: unexpected error in _find_file_in_repo for '%s': "
-                "%s — %s",
-                file_path,
-                type(exc).__name__,
-                exc,
-            )
-            return None
-
-    return await asyncio.to_thread(_search_tree)
-
-
-# ------------------------------------------------------------------ #
-# Line windowing                                                       #
-# ------------------------------------------------------------------ #
-
-def _extract_window(content: str, lineno: int) -> str:
-    """
-    Return a slice of *content* centred on *lineno* (1-based) with
-    CONTEXT_WINDOW lines above and below, annotated with line numbers.
-
-    Annotating with line numbers is critical so that the LLM and the diff
-    applier can reference exact positions without misalignment.
-    """
-    all_lines = content.splitlines()
-    total = len(all_lines)
-
-    # Convert to 0-indexed, clamp
-    target_idx = max(0, min(total - 1, lineno - 1))
-    start_idx = max(0, target_idx - CONTEXT_WINDOW)
-    end_idx = min(total, target_idx + CONTEXT_WINDOW + 1)
-
-    window_lines = []
-    for i in range(start_idx, end_idx):
-        # Prefix: line number right-aligned + marker for the error line
-        prefix = f"{i + 1:4d} {'→' if i == target_idx else ' '} "
-        window_lines.append(prefix + all_lines[i])
-
-    return "\n".join(window_lines)
+            merged.append((start, end))
+    return merged

@@ -1,79 +1,76 @@
 """
-Decision node — pure logic routing between "create_pr" and "flag_for_review".
+Decision node — pure logic: open a pull request or hand over to a human.
 
-No LLM calls.  No external I/O.  This node reads confidence and
-validation_passed from state and applies a single deterministic rule.
+Reads:
+    investigation, review, fix, patch, policy_violations, repo, can_push
 
-Routing rule:
-    confidence >= CONFIDENCE_AUTO_FIX_THRESHOLD (0.75)
-    AND validation_passed is True
-    → action = "create_pr"
+Writes:
+    action = "create_pr" | "flag_for_review"
+    flag_reason (when flagging)
 
-    Any other combination (low confidence, failed validation, missing values)
-    → action = "flag_for_review"
+A pull request is opened only when EVERY condition holds:
+    - the Reviewer approved the patch
+    - the Reviewer's confidence  ≥ CONFIDENCE_AUTO_PR_THRESHOLD
+    - the Investigator's confidence ≥ CONFIDENCE_AUTO_PR_THRESHOLD
+    - the Fix Engineer did not rate the change high-risk
+    - no safety-policy violation
+    - a repository is connected and the token can push to it
 
-Treating missing values as flag_for_review is the safe default — we never
-auto-merge a fix when we are uncertain.
+Any unmet condition flags the incident; the reasons are recorded verbatim
+so the dashboard can say exactly why no PR was opened.
 """
 
 from __future__ import annotations
 
+from typing import Any, Dict, List
+
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.state import IncidentState
-from app.schemas.fix import CONFIDENCE_AUTO_FIX_THRESHOLD
+from app.pipelines.timeline import record_step
 
 logger = get_logger(__name__)
 
 
-async def decision_node(state: IncidentState) -> IncidentState:
-    """
-    Route the pipeline to automatic PR creation or human-review escalation.
+async def decision_node(state: IncidentState) -> Dict[str, Any]:
+    threshold = settings.CONFIDENCE_AUTO_PR_THRESHOLD
+    review = state.get("review") or {}
+    investigation = state.get("investigation") or {}
+    fix = state.get("fix") or {}
+    patch = state.get("patch") or {}
 
-    Reads:
-        confidence, validation_passed
-
-    Writes:
-        action  →  "create_pr" | "flag_for_review"
-
-    Never writes error / status = "failed" — this node cannot fail because
-    it performs no I/O and the routing rule covers every possible input.
-    """
-    state = {**state}
-    incident_id = state.get("incident_id", "unknown")
-    logger.debug("decision_node ENTRY | incident_id=%s", incident_id)
-
-    try:
-        confidence: float = float(state.get("confidence") or 0.0)
-        validation_passed: bool = bool(state.get("validation_passed", False))
-
-        meets_threshold = confidence >= CONFIDENCE_AUTO_FIX_THRESHOLD
-        action: str = (
-            "create_pr" if (meets_threshold and validation_passed)
-            else "flag_for_review"
+    blockers: List[str] = []
+    if review.get("verdict") != "approve":
+        blockers.append("the Reviewer did not approve the patch")
+    if float(review.get("confidence") or 0) < threshold:
+        blockers.append(f"review confidence {float(review.get('confidence') or 0):.0%} is below the {threshold:.0%} auto-PR threshold")
+    if float(investigation.get("confidence") or 0) < threshold:
+        blockers.append(
+            f"root-cause confidence {float(investigation.get('confidence') or 0):.0%} is below the {threshold:.0%} auto-PR threshold"
         )
+    if fix.get("risk") == "high":
+        blockers.append("the Fix Engineer rated the change high-risk")
+    if state.get("policy_violations"):
+        blockers.append("the patch violates TrueAI's safety policy")
+    if not patch.get("files"):
+        blockers.append("there is no applied patch")
+    if not state.get("repo"):
+        blockers.append("no repository is connected")
+    elif not state.get("can_push"):
+        blockers.append("the connected GitHub account cannot push to the repository")
 
-        state["action"] = action
+    if blockers:
+        reason = "No pull request was opened because " + "; ".join(blockers) + ". The patch is attached as a suggestion."
+        await record_step(state, step="decision", kind="system", status="warning", summary=reason)
+        logger.info("decision_node | incident_id=%s | action=flag_for_review | blockers=%d", state.get("incident_id"), len(blockers))
+        return {"action": "flag_for_review", "flag_reason": reason}
 
-        logger.info(
-            "decision_node EXIT | incident_id=%s | confidence=%.3f | "
-            "threshold=%.2f | validation_passed=%s | action=%s",
-            incident_id,
-            confidence,
-            CONFIDENCE_AUTO_FIX_THRESHOLD,
-            validation_passed,
-            action,
-        )
-        return state
-
-    except Exception as exc:
-        # Should never happen since this node does no I/O, but guard anyway.
-        state["action"] = "flag_for_review"
-        logger.error(
-            "decision_node EXCEPTION (defaulting to flag_for_review) | "
-            "incident_id=%s | error=%s — %s",
-            incident_id,
-            type(exc).__name__,
-            exc,
-            exc_info=True,
-        )
-        return state
+    await record_step(
+        state,
+        step="decision",
+        kind="system",
+        status="ok",
+        summary=f"All checks passed (review {float(review['confidence']):.0%}, root cause {float(investigation['confidence']):.0%}) — opening a pull request.",
+    )
+    logger.info("decision_node | incident_id=%s | action=create_pr", state.get("incident_id"))
+    return {"action": "create_pr"}

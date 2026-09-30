@@ -1,36 +1,36 @@
-import { createClient } from '@/lib/supabase/server'
-import { apiClient } from '@/lib/api/client'
-import { Sidebar } from '@/components/layout/sidebar'
-import { TopNav } from '@/components/layout/top-nav'
+import { cookies } from 'next/headers'
+import { redirect } from 'next/navigation'
+import type { ReactNode } from 'react'
 
-export default async function DashboardLayout({
-  children,
-}: {
-  children: React.ReactNode
-}) {
+import { AppShell } from '@/components/app-shell'
+import { api } from '@/lib/api/client'
+import type { IncidentStats, Me } from '@/lib/api/types'
+import { createClient } from '@/lib/supabase/server'
+
+export default async function DashboardLayout({ children }: { children: ReactNode }) {
   const supabase = await createClient()
   const {
     data: { user },
   } = await supabase.auth.getUser()
+  if (!user) redirect('/login')
 
-  // Fetch display name from /auth/me; fall back silently on error
-  let fullName: string | null = null
-  try {
-    const me = await apiClient.get<{ full_name?: string }>('/auth/me')
-    fullName = me.full_name || null
-  } catch {
-    // non-fatal — sidebar will fall back to email prefix
-  }
+  // Both are best-effort: the pages show their own error states if the API is down.
+  const [me, stats] = await Promise.all([
+    api.get<Me>('/auth/me').catch(() => null),
+    api.get<IncidentStats>('/incidents/stats').catch(() => null),
+  ])
+
+  const theme = (await cookies()).get('theme')?.value
+  const displayName = me?.full_name?.trim() || user.email?.split('@')[0] || 'Your account'
 
   return (
-    <div className="flex h-screen bg-[#0a0a0a] overflow-hidden">
-      <Sidebar userEmail={user?.email ?? null} fullName={fullName} />
-      <div className="flex flex-col flex-1 md:ml-56 min-w-0 overflow-hidden">
-        <TopNav userEmail={user?.email ?? null} />
-        <main className="flex-1 overflow-y-auto">
-          {children}
-        </main>
-      </div>
-    </div>
+    <AppShell
+      displayName={displayName}
+      email={user.email ?? null}
+      needsYou={stats?.by_status.flagged ?? 0}
+      theme={theme === 'light' || theme === 'dark' ? theme : 'system'}
+    >
+      {children}
+    </AppShell>
   )
 }

@@ -1,94 +1,130 @@
+import 'server-only'
+
 import { createClient } from '@/lib/supabase/server'
 
-type HttpMethod = 'GET' | 'POST' | 'DELETE' | 'PATCH'
+/**
+ * Server-side client for the TrueAI API.
+ *
+ * Runs only on the server (Server Components, Server Actions, Route Handlers):
+ * the user's Supabase access token is read from the session cookie and sent as
+ * a Bearer token; it never reaches browser JavaScript through this module.
+ *
+ * - Every request has a timeout, so a slow or down API degrades one panel
+ *   instead of hanging the whole page.
+ * - Responses are never cached (incident data is live and per-user).
+ * - Errors surface as ApiError with the HTTP status and the API's own message.
+ */
 
-interface RequestOptions {
-  body?: unknown
-  headers?: Record<string, string>
-}
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
-class ApiError extends Error {
+const DEFAULT_TIMEOUT_MS = 15_000
+
+export class ApiError extends Error {
   constructor(
     message: string,
-    public readonly status: number
+    public readonly status: number,
   ) {
     super(message)
     this.name = 'ApiError'
   }
+
+  get isNotFound() {
+    return this.status === 404
+  }
+
+  get isUnauthorized() {
+    return this.status === 401
+  }
 }
 
-async function getAccessToken(): Promise<string | null> {
-  try {
-    const supabase = await createClient()
-    const {
-      data: { session },
-    } = await supabase.auth.getSession()
-    return session?.access_token ?? null
-  } catch {
-    return null
-  }
+function apiBaseUrl(): string {
+  const base = process.env.NEXT_PUBLIC_API_BASE_URL
+  if (!base) throw new ApiError('The TrueAI API URL is not configured (NEXT_PUBLIC_API_BASE_URL).', 500)
+  return base.replace(/\/+$/, '')
+}
+
+async function accessToken(): Promise<string | null> {
+  const supabase = await createClient()
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
+  return session?.access_token ?? null
 }
 
 async function request<T>(
   method: HttpMethod,
   path: string,
-  options: RequestOptions = {}
+  body?: unknown,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<T> {
-  const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL
-  if (!baseUrl) {
-    throw new ApiError('API base URL is not configured', 500)
+  const token = await accessToken()
+  if (!token) throw new ApiError('Your session has expired. Please sign in again.', 401)
+
+  let response: Response
+  try {
+    response = await fetch(`${apiBaseUrl()}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      cache: 'no-store',
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (error) {
+    const timedOut = error instanceof DOMException && error.name === 'TimeoutError'
+    throw new ApiError(
+      timedOut ? 'TrueAI took too long to respond. Please try again.' : 'Cannot reach the TrueAI API right now.',
+      503,
+    )
   }
 
-  const token = await getAccessToken()
+  if (response.status === 204) return undefined as T
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...options.headers,
+  let payload: unknown = null
+  const text = await response.text()
+  if (text) {
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      payload = null
+    }
   }
-
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`
-  }
-
-  const response = await fetch(`${baseUrl}${path}`, {
-    method,
-    headers,
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-  })
 
   if (!response.ok) {
-    let message = `Request failed with status ${response.status}`
-    try {
-      const errorBody = await response.json() as { detail?: string; error?: string }
-      message = errorBody.detail ?? errorBody.error ?? message
-    } catch {
-      // Response body is not JSON — use the default message
-    }
-    throw new ApiError(message, response.status)
+    throw new ApiError(errorMessage(payload, response.status), response.status)
   }
-
-  // Handle 204 No Content
-  if (response.status === 204) {
-    return undefined as T
-  }
-
-  return response.json() as Promise<T>
+  return payload as T
 }
 
-export const apiClient = {
-  get<T>(path: string, options?: RequestOptions): Promise<T> {
-    return request<T>('GET', path, options)
-  },
+function errorMessage(payload: unknown, status: number): string {
+  if (payload && typeof payload === 'object' && 'detail' in payload) {
+    const detail = (payload as { detail: unknown }).detail
+    if (typeof detail === 'string') return detail
+    if (Array.isArray(detail) && detail.length > 0) {
+      const first = detail[0] as { msg?: string; loc?: unknown[] }
+      const field = Array.isArray(first.loc) ? String(first.loc[first.loc.length - 1]) : ''
+      const msg = (first.msg ?? 'Invalid value').replace(/^Value error, /, '')
+      return field && field !== 'body' ? `${field.replace(/_/g, ' ')}: ${msg}` : msg
+    }
+  }
+  if (status === 429) return 'Too many requests. Please wait a moment and try again.'
+  if (status >= 500) return 'TrueAI hit an unexpected problem. Please try again.'
+  return `Request failed (${status}).`
+}
 
-  post<T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-    return request<T>('POST', path, { ...options, body })
-  },
+export const api = {
+  get: <T>(path: string, timeoutMs?: number) => request<T>('GET', path, undefined, timeoutMs),
+  post: <T>(path: string, body?: unknown, timeoutMs?: number) => request<T>('POST', path, body ?? {}, timeoutMs),
+  put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body ?? {}),
+  patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body ?? {}),
+  delete: <T = void>(path: string) => request<T>('DELETE', path),
+}
 
-  delete<T>(path: string, options?: RequestOptions): Promise<T> {
-    return request<T>('DELETE', path, options)
-  },
-
-  patch<T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-    return request<T>('PATCH', path, { ...options, body })
-  },
+/** Turn any thrown error into a message safe to show in the UI. */
+export function toMessage(error: unknown, fallback = 'Something went wrong. Please try again.'): string {
+  if (error instanceof ApiError) return error.message
+  return fallback
 }

@@ -1,36 +1,69 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# TrueAI dashboard
 
-## Getting Started
+The web app for [TrueAI](../README.md): sign up, connect GitHub and Sentry, and read the incident reports the agents
+write.
 
-First, run the development server:
+Next.js 16 (App Router, server components), Tailwind CSS v4, Supabase Auth.
+
+## Setup
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.local.example .env.local   # Supabase URL + anon key, TrueAI API URL, this app's URL
+npm install
+npm run dev                        # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The TrueAI API (see the root README) must be running. In Supabase → Authentication → URL Configuration, set the Site
+URL to this app's URL and add `<app URL>/auth/callback` to the redirect URLs (used by email confirmation and password
+reset).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Scripts
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Command | |
+|---|---|
+| `npm run dev` | Development server (Turbopack) |
+| `npm run build` / `npm start` | Production build and server |
+| `npm run lint` | ESLint |
+| `npm run typecheck` | TypeScript |
 
-## Learn More
+## How it is put together
 
-To learn more about Next.js, take a look at the following resources:
+- **Server-first.** Pages are server components that call the TrueAI API through `src/lib/api/client.ts`, which is
+  server-only: the browser never holds an API token or talks to the backend directly. Mutations are server actions in
+  `src/app/actions/`.
+- **Auth.** `src/proxy.ts` refreshes the Supabase session, protects the app routes (sending visitors to `/login?next=…`,
+  checked by `src/lib/redirect.ts` against open redirects) and sets a per-request CSP nonce.
+- **Live updates.** Incident pages poll quickly while the agents are working and slowly otherwise
+  (`src/components/auto-refresh.tsx`), pausing while the tab is hidden.
+- **Design.** A dark stage for the landing page, paper and ink for the app, and colour used only for incident state
+  (fixed, in review, needs you, failure). Public Sans with JetBrains Mono for code; light and dark themes. Design
+  tokens live in `src/app/globals.css`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```
+src/
+  app/
+    (auth)/          login, signup, forgot and reset password
+    (dashboard)/     incidents, incident report, integrations, settings
+    onboarding/      first-run setup
+    actions/         server actions
+    auth/, github/   auth callback, sign-out and GitHub hand-off route handlers
+  components/
+    ui/              buttons, fields, notices, status marks, dialogs
+    report/          diff view, timeline, prose, incident actions
+    integrations/    GitHub, repository picker, Sentry settings, webhook URL
+  lib/               API client and types, Supabase clients, formatting
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Docker
 
-## Deploy on Vercel
+```bash
+docker build \
+  --build-arg NEXT_PUBLIC_SUPABASE_URL=… \
+  --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=… \
+  --build-arg NEXT_PUBLIC_API_BASE_URL=… \
+  --build-arg NEXT_PUBLIC_APP_URL=… \
+  -t trueai-frontend .
+docker run -p 3000:3000 trueai-frontend
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+`NEXT_PUBLIC_*` values are compiled into the build, so they are build arguments.

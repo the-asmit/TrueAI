@@ -1,0 +1,49 @@
+# Full TrueAI backend: API + worker + scheduler + Redis.
+#
+#   cp .env.example .env   # fill in the required values
+#   docker compose up --build
+#
+# The dashboard (trueai-frontend/) is deployed separately (e.g. Vercel) and
+# points NEXT_PUBLIC_API_BASE_URL at this API.
+name: trueai
+
+x-backend: &backend
+  build: .
+  env_file: .env
+  environment:
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    LOG_DIR: ""
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    <<: *backend
+    ports:
+      - "8000:8000"
+
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+
+  beat:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app", "beat", "--loglevel=info", "--schedule=/tmp/celerybeat-schedule"]
+
+volumes:
+  redis-data:

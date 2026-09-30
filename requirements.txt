@@ -1,19 +1,25 @@
-fastapi
-uvicorn
-celery
-redis
-langgraph
-langchain
-langchain-openai
-langchain-groq
-supabase
-python-jose
-passlib
-python-dotenv
-pydantic
-pydantic-settings
-httpx
-PyGithub
-python-multipart
-slowapi
-cryptography
+# API
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.8,<3
+pydantic-settings>=2.7,<3
+httpx>=0.27,<1
+
+# Workers
+celery[redis]>=5.4,<6
+redis>=5.0,<9
+
+# Agents & LLM providers (add langchain-anthropic to use the anthropic provider)
+langgraph>=0.3,<2
+langchain-core>=0.3,<2
+langchain-groq>=0.2,<2
+langchain-openai>=0.2,<2
+PyYAML>=6.0,<7
+
+# Integrations
+supabase>=2.10,<3
+PyGithub>=2.4,<3
+
+# Security
+PyJWT[crypto]>=2.9,<3
+cryptography>=43

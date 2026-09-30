@@ -1,211 +1,106 @@
 """
-Parser node — normalises raw Sentry webhook payloads into structured state.
+Parser node — turns the stored Sentry payload into a normalised event.
 
-Responsibilities:
-- Validate the raw_payload against SentryWebhookPayload schema.
-- Extract error_type, error_message, and user-code-only stack frames.
-- Build a rich sentry_context dict from event-level metadata and per-frame
-  source context lines (pre/post context that Sentry SDK captures).
-- Fail fast (status="failed") if the payload contains no user-code frames —
-  without frames the entire downstream pipeline has nothing to analyse.
+Reads:
+    raw_payload, user_id
 
-This node never crashes: all exceptions are caught, the error is recorded
-in state, and the full (modified) state is always returned.
+Writes:
+    event
+    (on failure) status = "failed", error
+
+When the webhook carried no stack trace (Sentry's "issue" webhook, or a
+minimal alert) the full event is fetched from the Sentry API using the
+user's Sentry credentials.  A missing stack trace is NOT fatal: the agents
+can still analyse the error message and Sentry context, they just cannot
+propose a code patch without source locations.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List
+import asyncio
+import time
+from typing import Any, Dict
 
 from app.core.logging import get_logger
-from app.core.state import IncidentState
-from app.schemas.webhook import SentryWebhookPayload
+from app.core.state import IncidentState, failure
+from app.pipelines.timeline import plural, record_step, set_current_step
+from app.services import sentry as sentry_api
+from app.services.sentry_events import flatten_api_event, normalize_event
 
 logger = get_logger(__name__)
 
 
-async def parser_node(state: IncidentState) -> IncidentState:
-    """
-    Parse and normalise the raw Sentry webhook payload stored in *state*.
-
-    Reads:
-        raw_payload
-
-    Writes:
-        error_type, error_message, stack_frames, sentry_context, status
-
-    On failure writes:
-        error, status = "failed"
-    """
-    state = {**state}   # always work on a full copy
+async def parser_node(state: IncidentState) -> Dict[str, Any]:
     incident_id = state.get("incident_id", "unknown")
-    logger.debug("parser_node ENTRY | incident_id=%s", incident_id)
+    started = time.perf_counter()
+    await set_current_step(state, "Reading the Sentry event")
+
+    raw_payload = state.get("raw_payload") or {}
+    if not raw_payload or raw_payload.get("truncated"):
+        message = "The stored Sentry payload is empty or was too large to keep; nothing to analyse."
+        await record_step(state, step="parse", kind="tool", status="error", summary=message)
+        return failure(message)
 
     try:
-        raw_payload: Dict[str, Any] = state.get("raw_payload") or {}
-
-        if not raw_payload:
-            state["error"] = "raw_payload is empty — nothing to parse."
-            state["status"] = "failed"
-            logger.error(
-                "parser_node: empty raw_payload | incident_id=%s", incident_id
-            )
-            return state
-
-        # ---- Schema validation ---------------------------------------- #
-        try:
-            payload = SentryWebhookPayload.model_validate(raw_payload)
-        except Exception as schema_exc:
-            state["error"] = (
-                f"Sentry payload failed schema validation: "
-                f"{type(schema_exc).__name__}: {schema_exc}"
-            )
-            state["status"] = "failed"
-            logger.error(
-                "parser_node: schema validation failed | incident_id=%s | error=%s",
-                incident_id,
-                schema_exc,
-            )
-            return state
-
-        # ---- Fetch full event from Sentry API if no exception data ---- #
-        if not payload.get_stack_frames():
-            from app.services.sentry import fetch_sentry_event
-            event_id = (
-                raw_payload.get("event", {}).get("event_id")
-                or raw_payload.get("event_id")
-                or raw_payload.get("id")
-            )
-            project_slug = raw_payload.get("project_slug")
-            if event_id and project_slug:
-                logger.debug(
-                    "parser_node: no frames in webhook payload, fetching full event "
-                    "from Sentry API | incident_id=%s | event_id=%s",
-                    incident_id, event_id,
-                )
-                full_event = await fetch_sentry_event(project_slug, event_id)
-                if full_event:
-                    exception_data = full_event.get("entries", [])
-                    for entry in exception_data:
-                        if entry.get("type") == "exception":
-                            raw_payload = {**raw_payload, "exception": entry.get("data", {})}
-                            try:
-                                payload = SentryWebhookPayload.model_validate(raw_payload)
-                                logger.debug(
-                                    "parser_node: full event fetched successfully | "
-                                    "incident_id=%s | frames=%d",
-                                    incident_id, len(payload.get_stack_frames()),
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    "parser_node: full event schema validation failed | "
-                                    "incident_id=%s | error=%s",
-                                    incident_id, e,
-                                )
-                            break
-
-        # ---- Basic error fields --------------------------------------- #
-        error_type: str = payload.get_error_type() or "UnknownError"
-        error_message: str = payload.get_error_message() or ""
-
-        # ---- User-code frames only ------------------------------------ #
-        in_app_frames = payload.get_in_app_frames()
-        if not in_app_frames:
-            in_app_frames = payload.get_stack_frames()  # fallback to all frames
-
-        if not in_app_frames:
-            # No user-code frames means the crash is entirely in third-party
-            # or stdlib code — we cannot generate a meaningful fix.
-            state["error"] = (
-                "No user-code stack frames found in Sentry payload. "
-                "All frames are external (third-party / stdlib)."
-            )
-            state["status"] = "failed"
-            logger.error(
-                "parser_node: no in-app frames | incident_id=%s | "
-                "error_type=%s | total_frames=%d",
-                incident_id,
-                error_type,
-                len(payload.get_stack_frames()),
-            )
-            return state
-
-        stack_frames: List[Dict[str, Any]] = [f.to_dict() for f in in_app_frames]
-
-        # ---- Sentry context ------------------------------------------ #
-        # Collect event-level metadata plus per-frame source context lines
-        # into a single dict that the root-cause LLM will receive verbatim.
-        sentry_context: Dict[str, Any] = {
-            "environment": payload.environment,
-            "level": payload.level,
-            "platform": payload.platform,
-            "release": payload.release,
-            "server_name": payload.server_name,
-            "transaction": payload.transaction,
-            "tags": payload.tags,
-            "user": (
-                payload.user.model_dump(exclude_none=True) if payload.user else None
-            ),
-            "request": (
-                payload.request.model_dump(exclude_none=True)
-                if payload.request
-                else None
-            ),
-            "extra": payload.extra,
-            # Per-frame source context lines indexed by "filename:lineno" so
-            # the LLM can cross-reference code snippets with frame entries.
-            "frame_contexts": _build_frame_contexts(in_app_frames),
-        }
-
-        # ---- Write results back --------------------------------------- #
-        state["error_type"] = error_type
-        state["error_message"] = error_message
-        state["stack_frames"] = stack_frames
-        state["sentry_context"] = sentry_context
-        state["status"] = "processing"
-
-        logger.debug(
-            "parser_node EXIT | incident_id=%s | error_type=%s | "
-            "user_frames=%d | total_frames=%d",
-            incident_id,
-            error_type,
-            len(in_app_frames),
-            len(payload.get_stack_frames()),
-        )
-        return state
-
+        event = normalize_event(raw_payload)
     except Exception as exc:
-        state["error"] = f"parser_node unhandled exception: {type(exc).__name__}: {exc}"
-        state["status"] = "failed"
-        logger.error(
-            "parser_node EXCEPTION | incident_id=%s | error=%s",
-            incident_id,
-            exc,
-            exc_info=True,
-        )
-        return state
+        logger.error("parser_node: normalisation failed | incident_id=%s | error=%s", incident_id, exc, exc_info=True)
+        message = f"The Sentry payload could not be parsed ({type(exc).__name__})."
+        await record_step(state, step="parse", kind="tool", status="error", summary=message)
+        return failure(message)
+
+    enriched = False
+    if not event.get("frames"):
+        event, enriched = await _enrich_from_sentry_api(state, event)
+
+    frames = event.get("frames") or []
+    if frames:
+        summary = f"{event['error_type']} with {plural(len(frames), 'application frame')}"
+        if event.get("in_app_fallback"):
+            summary += " (Sentry marked no frames as in-app; vendor frames were filtered heuristically)"
+        status = "ok"
+    else:
+        summary = f"{event['error_type']} — no stack trace available, analysis will rely on the error details"
+        status = "warning"
+    if enriched:
+        summary += "; full event fetched from the Sentry API"
+
+    await record_step(
+        state,
+        step="parse",
+        kind="tool",
+        status=status,
+        summary=summary,
+        detail={"platform": event.get("platform"), "project": event.get("project"), "total_frames": event.get("total_frames")},
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    logger.info("parser_node EXIT | incident_id=%s | error_type=%s | frames=%d", incident_id, event["error_type"], len(frames))
+    return {"event": event}
 
 
-# ------------------------------------------------------------------ #
-# Internal helpers                                                     #
-# ------------------------------------------------------------------ #
+async def _enrich_from_sentry_api(state: IncidentState, event: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    """Fetch the complete event when the webhook had no frames. Returns (event, enriched)."""
+    try:
+        creds = await asyncio.to_thread(sentry_api.resolve_credentials, state["user_id"])
+    except Exception as exc:
+        logger.warning("parser_node: could not load Sentry credentials | incident_id=%s | error=%s", state.get("incident_id"), exc)
+        return event, False
+    if creds is None:
+        return event, False
 
-def _build_frame_contexts(frames) -> Dict[str, Any]:
-    """
-    Build a dict of per-frame source context keyed by ``"filename:lineno"``.
+    full = None
+    if event.get("event_id") and event.get("project"):
+        full = await sentry_api.fetch_event(creds, event["project"], event["event_id"])
+    if full is None and event.get("issue_id"):
+        full = await sentry_api.fetch_latest_issue_event(creds, event["issue_id"])
+    if not full:
+        return event, False
 
-    Having inline pre/post context in sentry_context means the root-cause
-    prompt can reference exact source lines without waiting for GitHub to
-    return them, which is useful for files that GitHub cannot reach.
-    """
-    contexts: Dict[str, Any] = {}
-    for frame in frames:
-        key = f"{frame.filename or 'unknown'}:{frame.lineno or '?'}"
-        contexts[key] = {
-            "function": frame.function,
-            "context_line": frame.context_line,
-            "pre_context": frame.pre_context,
-            "post_context": frame.post_context,
-        }
-    return contexts
+    fetched = normalize_event({"event": flatten_api_event(full)})
+    if not fetched.get("frames"):
+        return event, False
+    # Keep identity from the webhook (issue grouping) and take evidence from the API.
+    for key in ("issue_id", "issue_url", "project", "fingerprint"):
+        if event.get(key):
+            fetched[key] = event[key]
+    return fetched, True

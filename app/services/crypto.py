@@ -1,107 +1,84 @@
 """
-Symmetric encryption helpers for GitHub OAuth access tokens.
+Encryption for secrets stored in the database (GitHub OAuth tokens, Sentry
+tokens and webhook signing secrets).
 
-Uses Fernet (AES-128-CBC + HMAC-SHA256) from the ``cryptography`` package.
-The encryption key is read from ``settings.GITHUB_TOKEN_ENCRYPTION_KEY`` and
-must be a valid URL-safe Base64-encoded 32-byte key as produced by
-``cryptography.fernet.Fernet.generate_key()``.
+Uses ``MultiFernet`` (AES-128-CBC + HMAC-SHA256) so keys can be rotated:
+``GITHUB_TOKEN_ENCRYPTION_KEY`` may hold several comma-separated keys — the
+first encrypts, every key decrypts.  ``rotate`` re-encrypts a value under
+the current primary key.
 
-Module-load validation
-──────────────────────
-The Fernet instance is constructed once at module import time.  If the key
-is missing or malformed the module raises ``RuntimeError`` immediately,
-which causes the FastAPI startup to fail with a clear error message rather
-than serving requests with a broken encryption layer.
-
-Public API
-──────────
-    encrypt_token(token: str) -> str
-        Encrypt a plaintext GitHub access token.  Returns a Fernet token
-        string (URL-safe Base64).
-
-    decrypt_token(encrypted: str) -> str
-        Decrypt a Fernet token string.  Falls back to returning the raw
-        string as-is when decryption fails — this allows existing rows
-        written before encryption was enabled to continue working without
-        a migration step (fail-open migration path).
-
-Security notes
-──────────────
-- Plaintext tokens are NEVER written to any log record in this module.
-- Fernet tokens are self-authenticating (HMAC) — tampered ciphertexts
-  are detected and cause an ``InvalidToken`` exception which the fallback
-  path handles gracefully.
+Legacy plaintext GitHub tokens (written before encryption existed) are still
+readable so existing connections keep working; they are recognised by their
+GitHub prefix and re-encrypted by the caller on first use.
 """
 
 from __future__ import annotations
 
-from cryptography.fernet import Fernet
+import re
+from functools import lru_cache
+
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
 from app.core.config import settings
+from app.core.errors import ConfigurationError
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# ------------------------------------------------------------------ #
-# Module-load key validation                                           #
-# ------------------------------------------------------------------ #
-
-try:
-    _fernet = Fernet(settings.GITHUB_TOKEN_ENCRYPTION_KEY.encode())
-except Exception:
-    raise RuntimeError(
-        "Invalid GITHUB_TOKEN_ENCRYPTION_KEY — must be a valid Fernet key. "
-        "Generate one with: python -c \"from cryptography.fernet import Fernet; "
-        "print(Fernet.generate_key().decode())\""
-    )
+_LEGACY_GITHUB_TOKEN = re.compile(r"^(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|[0-9a-f]{40})$")
 
 
-# ------------------------------------------------------------------ #
-# Public functions                                                     #
-# ------------------------------------------------------------------ #
+@lru_cache(maxsize=1)
+def _fernet() -> MultiFernet:
+    raw = settings.secret("GITHUB_TOKEN_ENCRYPTION_KEY") or ""
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
+        raise ConfigurationError("GITHUB_TOKEN_ENCRYPTION_KEY is not set.")
+    try:
+        return MultiFernet([Fernet(k.encode()) for k in keys])
+    except (ValueError, TypeError) as exc:
+        raise ConfigurationError(
+            "GITHUB_TOKEN_ENCRYPTION_KEY must contain valid Fernet keys. Generate one with: "
+            "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        ) from exc
 
-def encrypt_token(token: str) -> str:
+
+def validate_key() -> None:
+    """Fail fast at startup when the encryption key is missing or malformed."""
+    _fernet()
+
+
+def encrypt_secret(value: str) -> str:
+    if not value:
+        raise ValueError("Cannot encrypt an empty value.")
+    return _fernet().encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def decrypt_secret(ciphertext: str) -> str:
+    """Decrypt a stored secret; raises ``InvalidToken`` when it cannot be decrypted."""
+    return _fernet().decrypt(ciphertext.encode("ascii")).decode("utf-8")
+
+
+def decrypt_github_token(stored: str) -> tuple[str, bool]:
     """
-    Encrypt *token* with Fernet and return the ciphertext as a string.
+    Return ``(token, is_legacy_plaintext)``.
 
-    Args:
-        token: Plaintext GitHub OAuth access token.
-
-    Returns:
-        URL-safe Base64-encoded Fernet ciphertext string.
-
-    Raises:
-        ValueError: If *token* is empty.
-        Exception: Propagated from ``cryptography`` on unexpected failure.
-    """
-    if not token:
-        raise ValueError("encrypt_token: token must not be empty.")
-    return _fernet.encrypt(token.encode()).decode()
-
-
-def decrypt_token(encrypted: str) -> str:
-    """
-    Decrypt a Fernet ciphertext string back to a plaintext token.
-
-    Plaintext fallback (migration path)
-    ────────────────────────────────────
-    If decryption fails (e.g. the stored value is a legacy plaintext token
-    written before encryption was introduced), the raw string is returned
-    as-is with a WARNING log.  This allows existing DB rows to continue
-    working without a bulk migration.  Once all rows have been re-encrypted,
-    the fallback can be removed.
-
-    Args:
-        encrypted: Fernet ciphertext string, or a legacy plaintext token.
-
-    Returns:
-        Plaintext GitHub OAuth access token.
+    Raises ``InvalidToken`` when the value is neither a valid ciphertext nor
+    a recognisable legacy plaintext token (e.g. the key was rotated away).
     """
     try:
-        return _fernet.decrypt(encrypted.encode()).decode()
-    except Exception:
-        logger.warning(
-            "decrypt_token: token appears unencrypted — using as plaintext "
-            "(migration fallback). Re-encrypt this token to suppress this warning."
-        )
-        return encrypted
+        return decrypt_secret(stored), False
+    except (InvalidToken, ValueError, UnicodeError):
+        if _LEGACY_GITHUB_TOKEN.match(stored or ""):
+            logger.warning("Found a legacy plaintext GitHub token; it will be re-encrypted.")
+            return stored, True
+        raise InvalidToken("Stored GitHub token cannot be decrypted with the configured keys.")
+
+
+def rotate(ciphertext: str) -> str:
+    """Re-encrypt *ciphertext* under the current primary key."""
+    return _fernet().rotate(ciphertext.encode("ascii")).decode("ascii")
+
+
+# Backwards-compatible names used by older call sites.
+encrypt_token = encrypt_secret

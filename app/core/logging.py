@@ -1,174 +1,217 @@
 """
-Production-grade logging setup for TrueAI.
+Logging for TrueAI.
 
-Features:
-- Structured format:  timestamp | level | module | message
-- Simultaneous output to console (stdout) and a rotating log file
-- RotatingFileHandler: 10 MB per file, 5 backups
-- SensitiveDataFilter: redacts API keys, tokens, and secrets before any
-  log record is emitted — prevents credential leakage in log aggregators
-- Thread-safe: the stdlib logging module is thread-safe by design
+- One root configuration per process (``configure_logging``), text or JSON.
+- Redaction runs on the *final formatted string*, so secrets inside
+  exception tracebacks, third-party log lines and uvicorn access logs
+  (which carry the webhook ``?key=`` query string) are scrubbed too.
+- ``request_id`` / ``incident_id`` are carried in context variables and
+  attached to every record emitted while they are set.
+- Optional rotating file output, one file per process type so the API and
+  the Celery worker never fight over the same file handle.
 """
 
+from __future__ import annotations
+
+import contextvars
+import json
 import logging
 import logging.handlers
 import re
 import sys
-from pathlib import Path
-from typing import Final
+from datetime import datetime, timezone
+from typing import Final, Optional
 
-
-# ------------------------------------------------------------------ #
-# Constants                                                            #
-# ------------------------------------------------------------------ #
-
-_LOG_DIR: Final[Path] = Path("logs")
-_LOG_FILE: Final[Path] = _LOG_DIR / "app.log"
-_MAX_BYTES: Final[int] = 10 * 1024 * 1024   # 10 MB
-_BACKUP_COUNT: Final[int] = 5
 _DATE_FMT: Final[str] = "%Y-%m-%dT%H:%M:%S"
+_TEXT_FMT: Final[str] = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s%(ctx)s"
+_MAX_BYTES: Final[int] = 10 * 1024 * 1024
+_BACKUP_COUNT: Final[int] = 5
 
-# Structured format — all fields separated by " | " for easy parsing
-_LOG_FMT: Final[str] = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+request_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_id", default=None)
+incident_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("incident_id", default=None)
 
 # ------------------------------------------------------------------ #
-# Sensitive-data redaction                                             #
+# Redaction                                                            #
 # ------------------------------------------------------------------ #
 
-# Each tuple is (compiled_regex, replacement_string).
-# Order matters: more specific patterns should come first.
-_SENSITIVE_PATTERNS: Final[list] = [
-    # Generic key=value / key: value patterns
+_SENSITIVE_PATTERNS: Final[list[tuple[re.Pattern[str], str]]] = [
+    # TrueAI API keys (also inside ?key= query strings)
+    (re.compile(r"tai_[A-Za-z0-9_\-]{8,}"), "tai_[REDACTED]"),
+    # key=value pairs in URLs / query strings
+    (re.compile(r"(?i)([?&](?:key|api_key|token|access_token|code|state|handoff)=)[^&\s\"']+"), r"\1[REDACTED]"),
+    # GitHub tokens
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"), "[GITHUB_TOKEN_REDACTED]"),
+    # LLM provider keys
+    (re.compile(r"\bgsk_[A-Za-z0-9]{20,}\b"), "[GROQ_KEY_REDACTED]"),
+    (re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}\b"), "[LLM_KEY_REDACTED]"),
+    # Sentry tokens
+    (re.compile(r"\bsntry[su]_[A-Za-z0-9_=\-]{20,}\b"), "[SENTRY_TOKEN_REDACTED]"),
+    # JWTs (Supabase access tokens, service role key)
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b"), "[JWT_REDACTED]"),
+    # Authorization headers
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9+/=_\-\.]{12,}"), r"\1 [REDACTED]"),
+    # Generic key: value / key=value secrets
     (
         re.compile(
-            r'(?i)(api[_-]?key|apikey|secret|password|passwd|token|bearer'
-            r'|authorization|auth|credential|private[_-]?key)'
-            r'(["\s:=]+)([A-Za-z0-9+/=_\-\.]{8,})',
-            re.IGNORECASE,
+            r"(?i)\b(api[_-]?key|secret|password|passwd|client_secret|access_token|refresh_token|private[_-]?key)"
+            r"(\s*[\"']?\s*[:=]\s*[\"']?)([^\s\"',&]{6,})"
         ),
         r"\1\2[REDACTED]",
     ),
-    # Anthropic sk-ant-... keys
-    (re.compile(r"sk-ant-[A-Za-z0-9\-_]{20,}"), "[ANTHROPIC_KEY_REDACTED]"),
-    # GitHub tokens (ghp_, ghs_, github_pat_)
-    (re.compile(r"(ghp_|ghs_|github_pat_)[A-Za-z0-9_]{20,}"), "[GITHUB_TOKEN_REDACTED]"),
-    # JWT — three base64url segments separated by dots
-    (
-        re.compile(
-            r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-        ),
-        "[JWT_REDACTED]",
-    ),
-    # Supabase service-role / anon keys (long base64-like strings after "ey")
-    (re.compile(r"ey[A-Za-z0-9_\-]{40,}\.[A-Za-z0-9_\-]{40,}"), "[SUPABASE_KEY_REDACTED]"),
 ]
 
 
-def _redact(text: str) -> str:
-    """Apply all sensitive-data patterns to *text* and return the sanitised result."""
+def redact(text: str) -> str:
+    """Return *text* with every known credential pattern replaced."""
     for pattern, replacement in _SENSITIVE_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
 
 
+class _ContextFilter(logging.Filter):
+    """Attach request/incident correlation ids to every record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        record.request_id = request_id_var.get()
+        record.incident_id = incident_id_var.get()
+        try:
+            message = record.getMessage()
+        except Exception:  # a malformed record still gets logged; the formatter reports the problem
+            message = ""
+        parts = []
+        for key in ("request_id", "incident_id"):
+            value = getattr(record, key)
+            # Skip ids the message already names, so lines don't repeat them.
+            if value and f"{key}={value}" not in message:
+                parts.append(f"{key}={value}")
+        record.ctx = f" | {' '.join(parts)}" if parts else ""
+        return True
+
+
+class RedactingTextFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        if not hasattr(record, "ctx"):
+            record.ctx = ""
+        return redact(super().format(record))
+
+
+class RedactingJsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key in ("request_id", "incident_id"):
+            value = getattr(record, key, None)
+            if value:
+                payload[key] = value
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return redact(json.dumps(payload, default=str, ensure_ascii=False))
+
+
 class SensitiveDataFilter(logging.Filter):
     """
-    Logging filter that redacts credentials from log records in-place.
-
-    Applied to both handlers so no sensitive data can reach the console
-    or the log file, regardless of which logger emitted the record.
+    Logger-level filter for loggers that bypass the root handlers
+    (uvicorn installs its own handlers).  Redacts string message/args in
+    place while preserving the args structure — uvicorn's access formatter
+    unpacks ``record.args`` positionally.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
-        # Redact the main message
-        record.msg = _redact(str(record.msg))
-
-        # Redact any extra positional args (used in %-style formatting)
-        if record.args:
-            if isinstance(record.args, dict):
-                record.args = {k: _redact(str(v)) for k, v in record.args.items()}
-            else:
-                record.args = tuple(_redact(str(a)) for a in record.args)
-
-        # Redact exc_text if an exception was already formatted
-        if record.exc_text:
-            record.exc_text = _redact(record.exc_text)
-
-        return True  # always pass the record through (after sanitisation)
+        if isinstance(record.msg, str):
+            record.msg = redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact(a) if isinstance(a, str) else a for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: redact(v) if isinstance(v, str) else v for k, v in record.args.items()}
+        return True
 
 
 # ------------------------------------------------------------------ #
-# Internal setup — runs once at import time                            #
+# Configuration                                                        #
 # ------------------------------------------------------------------ #
 
-def _configure_root_logger() -> None:
-    """
-    Configure the root logger exactly once.
+_configured_service: Optional[str] = None
 
-    Subsequent calls to get_logger() simply retrieve a child logger that
-    inherits handlers from root — no duplicate handlers are created.
-    """
-    root = logging.getLogger()
 
-    # Avoid re-configuring if already set up (e.g., in a testing context)
-    if root.handlers:
+def configure_logging(service: str = "app", *, force: bool = False) -> None:
+    """
+    Configure the root logger for this process.  Safe to call repeatedly —
+    only the first call (or a ``force=True`` call) has an effect.
+    """
+    global _configured_service
+    if _configured_service is not None and not force:
         return
 
-    root.setLevel(logging.DEBUG)  # handlers control the effective level
+    # Imported lazily so this module has no import-time dependency on config
+    # (config validation errors must still be loggable).
+    try:
+        from app.core.config import settings
 
-    formatter = logging.Formatter(fmt=_LOG_FMT, datefmt=_DATE_FMT)
-    sensitive_filter = SensitiveDataFilter()
+        level = getattr(logging, settings.LOG_LEVEL)
+        use_json = settings.LOG_FORMAT == "json"
+        log_dir = settings.log_dir_path
+    except Exception:  # pragma: no cover - misconfigured env
+        level, use_json, log_dir = logging.INFO, False, None
 
-    # ---- Console handler (INFO+) --------------------------------------- #
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    console_handler.addFilter(sensitive_filter)
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.setLevel(min(level, logging.DEBUG) if log_dir else level)
 
-    # ---- Rotating file handler (DEBUG+) -------------------------------- #
-    _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.handlers.RotatingFileHandler(
-        filename=_LOG_FILE,
-        maxBytes=_MAX_BYTES,
-        backupCount=_BACKUP_COUNT,
-        encoding="utf-8",
-        delay=True,   # defer file creation until the first record is emitted
+    formatter: logging.Formatter = (
+        RedactingJsonFormatter() if use_json else RedactingTextFormatter(_TEXT_FMT, _DATE_FMT)
     )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    file_handler.addFilter(sensitive_filter)
+    context_filter = _ContextFilter()
 
-    root.addHandler(console_handler)
-    root.addHandler(file_handler)
+    # Windows consoles default to cp1252; never let a non-ASCII character in a
+    # log line (e.g. a user's error message) raise UnicodeEncodeError.
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(level)
+    console.setFormatter(formatter)
+    console.addFilter(context_filter)
+    root.addHandler(console)
 
-    # Silence overly verbose third-party loggers at WARNING+
-    for noisy_lib in ("httpx", "httpcore", "urllib3", "celery", "kombu"):
-        logging.getLogger(noisy_lib).setLevel(logging.WARNING)
+    if log_dir is not None and service != "test":
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                filename=log_dir / f"{service}.log",
+                maxBytes=_MAX_BYTES,
+                backupCount=_BACKUP_COUNT,
+                encoding="utf-8",
+                delay=True,
+            )
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter)
+            file_handler.addFilter(context_filter)
+            root.addHandler(file_handler)
+        except OSError as exc:  # read-only filesystem in containers
+            root.warning("File logging disabled (%s): %s", log_dir, exc)
 
+    for noisy in ("httpx", "httpcore", "urllib3", "hpack", "celery", "kombu", "github", "openai", "groq"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# Run once on first import
-_configure_root_logger()
+    # uvicorn logs through its own handlers; redact at the logger level so
+    # ``?key=tai_...`` never reaches the access log.
+    redactor = SensitiveDataFilter()
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        uv_logger = logging.getLogger(name)
+        if not any(isinstance(f, SensitiveDataFilter) for f in uv_logger.filters):
+            uv_logger.addFilter(redactor)
 
+    _configured_service = service
 
-# ------------------------------------------------------------------ #
-# Public API                                                           #
-# ------------------------------------------------------------------ #
 
 def get_logger(name: str) -> logging.Logger:
-    """
-    Return a named logger that inherits the root logger's handlers.
-
-    Usage::
-
-        from app.core.logging import get_logger
-        logger = get_logger(__name__)
-        logger.info("Webhook received", extra={"incident_id": incident_id})
-
-    Args:
-        name: Typically ``__name__`` of the calling module.
-
-    Returns:
-        A :class:`logging.Logger` pre-configured with structured formatting
-        and sensitive-data redaction.
-    """
+    """Return a named logger; configures logging with defaults on first use."""
+    if _configured_service is None:
+        configure_logging("app")
     return logging.getLogger(name)

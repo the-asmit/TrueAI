@@ -1,207 +1,118 @@
 """
 Supabase JWT verification for TrueAI.
 
-Supabase signs all JWTs with ES256 (ECDSA P-256) using the project's public key.
-This module verifies those tokens server-side without making any network
-calls — all validation is purely cryptographic.
+Signing keys are read from the project's JWKS endpoint
+(``{SUPABASE_URL}/auth/v1/.well-known/jwks.json``) and cached, so rotating
+the Supabase signing key needs no code change or redeploy.
 
 Verification guarantees
 ───────────────────────
-1. Signature   — rejects tokens signed with a different key.
-2. Expiry      — rejects tokens whose ``exp`` claim is in the past.
-3. Subject     — rejects tokens with a missing or empty ``sub`` claim
-                 (Supabase populates ``sub`` with the user's UUID).
-4. Algorithm   — only ES256 is accepted; HS256/RS256/none/other are
-                 rejected to prevent algorithm-confusion attacks.
+1. Signature   — ES256 / RS256 against the published JWKS key for the
+                 token's ``kid``.  HS256 is accepted only when
+                 ``SUPABASE_JWT_SECRET`` is configured (legacy projects).
+2. Algorithm   — the algorithm must match the key type; ``none`` and any
+                 unexpected algorithm are rejected (no algorithm confusion).
+3. Claims      — ``exp`` (with 30 s leeway), ``aud`` = authenticated,
+                 ``iss`` = this project, non-empty ``sub``, and ``role`` must
+                 be ``authenticated`` (anon and service_role tokens are refused).
 
-All failure modes raise ``HTTPException(401)`` with a descriptive
-(but non-leaking) ``detail`` message so the API layer can return a
-well-formed 401 response without extra error handling at the route level.
+Failures raise ``HTTPException(401)``; an unreachable JWKS endpoint raises
+``HTTPException(503)`` so clients do not treat an outage as a logout.
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Dict
 
+import jwt
 from fastapi import HTTPException, status
-from jose import ExpiredSignatureError, JWTError, jwt
-from jose.exceptions import JWTClaimsError
+from jwt import PyJWKClient
 
 from app.core.config import settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Supabase uses ES256 (ECDSA P-256) for JWT signing; accepting other
-# algorithms opens the door to algorithm-confusion attacks (e.g. HS256
-# with the public key as the secret, or the "alg: none" bypass).
-_ALGORITHM: str = "ES256"
-
-# Supabase audience claim expected value.  Supabase sets aud="authenticated"
-# for all logged-in user tokens.  We verify this to ensure TrueAI does not
-# accept service-role tokens or anon tokens as user credentials.
-_EXPECTED_AUDIENCE: str = "authenticated"
+_ASYMMETRIC_ALGORITHMS = ("ES256", "RS256")
+_LEEWAY_SECONDS = 30
 
 
-# Supabase ECC P-256 public key (JWK format)
-_SUPABASE_PUBLIC_JWK = {
-    "x": "_Y8PYL_C351JwEnSjVpPqY2fF1_kvdlXq8WVfUqVABA",
-    "y": "30iVSGkefQp7D6Q3fOmGP74LDIU-4zQqcsnIMj0ijBE",
-    "alg": "ES256",
-    "crv": "P-256",
-    "kty": "EC",
-    "kid": "9dbe1a07-1305-434f-9c13-41ab62a7ee66",
-}
+@lru_cache(maxsize=1)
+def _jwks_client() -> PyJWKClient:
+    return PyJWKClient(
+        f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json",
+        cache_keys=True,
+        cache_jwk_set=True,
+        lifespan=600,
+        timeout=5,
+    )
 
 
-# ------------------------------------------------------------------ #
-# Public API                                                           #
-# ------------------------------------------------------------------ #
+def _issuer() -> str:
+    return f"{settings.SUPABASE_URL}/auth/v1"
+
 
 def verify_jwt(token: str) -> Dict[str, Any]:
-    """
-    Decode and fully verify a Supabase-issued JWT.
-
-    Performs:
-    - ECDSA-SHA256 (ES256) signature verification using Supabase public JWK
-    - Expiry (``exp``) validation
-    - Audience (``aud``) validation — must be ``"authenticated"``
-    - Presence and non-emptiness of the ``sub`` claim
-
-    Args:
-        token: Raw JWT string (the ``Bearer <token>`` value from the
-               ``Authorization`` header, with the ``Bearer `` prefix
-               already stripped by the dependency layer).
-
-    Returns:
-        The decoded claims payload as a plain dict.
-
-    Raises:
-        :class:`fastapi.HTTPException` (401) for any verification failure
-        with a descriptive ``detail`` message.
-    """
-    if not token or not token.strip():
-        _raise_401("Authorization token is missing.")
+    """Decode and fully verify a Supabase access token; returns its claims."""
+    if not token or token.count(".") != 2:
+        _raise_401("Authorization token is missing or malformed.")
 
     try:
-        payload: Dict[str, Any] = jwt.decode(
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError:
+        _raise_401("Authorization token is malformed.")
+    algorithm = header.get("alg")
+
+    if algorithm in _ASYMMETRIC_ALGORITHMS:
+        try:
+            signing_key = _jwks_client().get_signing_key_from_jwt(token).key
+        except jwt.PyJWKClientConnectionError as exc:
+            logger.error("JWKS endpoint unreachable: %s", exc)
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Authentication is temporarily unavailable.")
+        except jwt.PyJWKClientError:
+            _raise_401("Token was signed with an unknown key.")
+        key: Any = signing_key
+    elif algorithm == "HS256" and settings.secret("SUPABASE_JWT_SECRET"):
+        key = settings.secret("SUPABASE_JWT_SECRET")
+    else:
+        _raise_401("Token uses an unsupported signing algorithm.")
+
+    try:
+        claims: Dict[str, Any] = jwt.decode(
             token,
-            _SUPABASE_PUBLIC_JWK,  # ES256 public JWK — not a shared secret
-            algorithms=[_ALGORITHM],
-            audience=_EXPECTED_AUDIENCE,
-            options={
-                "verify_exp": True,
-                "verify_aud": True,
-                "verify_iat": True,
-                "require_exp": True,
-                "require_sub": False,  # we validate sub manually below
-            },
+            key,
+            algorithms=[algorithm],
+            audience=settings.SUPABASE_JWT_AUDIENCE,
+            issuer=_issuer(),
+            leeway=_LEEWAY_SECONDS,
+            options={"require": ["exp", "sub", "iat"]},
         )
-    except ExpiredSignatureError:
-        logger.info("JWT verification failed: token has expired.")
-        _raise_401("Token has expired. Please re-authenticate.")
+    except jwt.ExpiredSignatureError:
+        _raise_401("Token has expired. Please sign in again.")
+    except jwt.InvalidAudienceError:
+        _raise_401("Token audience is not accepted.")
+    except jwt.InvalidIssuerError:
+        _raise_401("Token was not issued by this project.")
+    except jwt.PyJWTError as exc:
+        logger.info("JWT rejected: %s", type(exc).__name__)
+        _raise_401("Token is invalid.")
 
-    except JWTClaimsError as exc:
-        # Covers audience mismatch and other claim errors.
-        logger.info("JWT verification failed: invalid claims — %s.", exc)
-        _raise_401(f"Token has invalid claims: {exc}")
-
-    except JWTError as exc:
-        # Covers bad signature, malformed header, unsupported algorithm, etc.
-        logger.info("JWT verification failed: %s.", type(exc).__name__)
-        _raise_401("Token is invalid or has been tampered with.")
-
-    except Exception as exc:
-        # Catch-all for unexpected errors from the jose library so we never
-        # return a 500 for a bad token.
-        logger.error(
-            "Unexpected error during JWT verification: %s — %s.",
-            type(exc).__name__,
-            exc,
-        )
-        _raise_401("Token could not be verified due to an internal error.")
-
-    # ---- Post-decode claim validation --------------------------------- #
-
-    sub = payload.get("sub")
-    if not sub or not str(sub).strip():
-        logger.info("JWT verification failed: 'sub' claim is absent or empty.")
-        _raise_401("Token is missing the required 'sub' (subject) claim.")
-
-    # Supabase sets role="authenticated" for user tokens.  Reject service-role
-    # JWTs that may have slipped through audience validation on older jose
-    # versions.
-    role = payload.get("role", "")
-    if role == "service_role":
-        logger.warning(
-            "Rejected service_role JWT used as a user credential "
-            "(sub=%s).", _mask_sub(sub)
-        )
-        _raise_401("Service-role tokens are not accepted as user credentials.")
-
-    logger.debug("JWT verified successfully (sub=%s).", _mask_sub(sub))
-    return payload
+    if not str(claims.get("sub") or "").strip():
+        _raise_401("Token has no subject.")
+    if claims.get("role") != "authenticated":
+        logger.warning("Rejected JWT with role=%s used as a user credential.", claims.get("role"))
+        _raise_401("Only signed-in user tokens are accepted.")
+    return claims
 
 
 def get_user_id_from_token(token: str) -> str:
-    """
-    Verify *token* and return the ``sub`` claim (Supabase user UUID).
+    return str(verify_jwt(token)["sub"])
 
-    This is the primary function used by FastAPI dependencies to extract
-    the authenticated user ID from a request.
-
-    Args:
-        token: Raw JWT string.
-
-    Returns:
-        The ``sub`` claim value — always a non-empty string when this
-        function returns without raising.
-
-    Raises:
-        :class:`fastapi.HTTPException` (401) on any verification failure.
-    """
-    payload = verify_jwt(token)
-    return str(payload["sub"])
-
-
-def get_token_claims(token: str) -> Dict[str, Any]:
-    """
-    Verify *token* and return all decoded claims.
-
-    Useful when routes need more than just the user ID — e.g. the Supabase
-    ``email``, ``app_metadata``, or custom claims.
-
-    Args:
-        token: Raw JWT string.
-
-    Returns:
-        Full decoded claims payload.
-
-    Raises:
-        :class:`fastapi.HTTPException` (401) on any verification failure.
-    """
-    return verify_jwt(token)
-
-
-# ------------------------------------------------------------------ #
-# Internal helpers                                                     #
-# ------------------------------------------------------------------ #
 
 def _raise_401(detail: str) -> None:
-    """Raise ``HTTPException(401)`` with the given detail message."""
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=detail,
         headers={"WWW-Authenticate": "Bearer"},
     )
-
-
-def _mask_sub(sub: str) -> str:
-    """
-    Return a partially masked subject for safe log output.
-
-    Supabase UUIDs look like ``550e8400-e29b-41d4-a716-446655440000``.
-    We show the first 8 characters so log lines are correlatable without
-    exposing the full UUID.
-    """
-    return f"{sub[:8]}..." if len(sub) > 8 else "****"

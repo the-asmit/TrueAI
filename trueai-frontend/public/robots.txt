@@ -1,0 +1,8 @@
+User-agent: *
+Disallow: /dashboard
+Disallow: /integrations
+Disallow: /settings
+Disallow: /onboarding
+Disallow: /auth/
+Disallow: /github/
+Disallow: /reset-password

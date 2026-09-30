@@ -1,813 +1,178 @@
 """
-Authentication routes for TrueAI.
+Account, profile and API key routes.
 
 Endpoints
 ─────────
-POST   /auth/api-keys              — generate a new API key (shows raw once)
-DELETE /auth/api-keys/{key_id}     — revoke an API key
-GET    /auth/github/authorize      — begin GitHub OAuth flow
-GET    /auth/github/callback       — complete GitHub OAuth flow
-GET    /auth/me                    — return the authenticated user's info
+GET    /auth/me                  profile + connection status used by the dashboard
+POST   /auth/profile             save display name
+DELETE /auth/account             delete the account and every piece of data
+GET    /auth/api-keys            list keys (prefix, name, last used — never the secret)
+POST   /auth/api-keys            create a key; returns the raw key and webhook URL ONCE
+DELETE /auth/api-keys/{key_id}   revoke a key
+GET    /auth/user/webhook-url    webhook base URL (the full URL is only shown at creation)
 
-GitHub OAuth flow
-─────────────────
-1. Client (browser) calls GET /auth/github/authorize?redirect_uri=<frontend_url>
-   The user must be authenticated (Supabase JWT or API key).
-   Returns a redirect URL the client must follow in the browser.
-
-2. User authenticates on GitHub and is redirected to:
-   GET /auth/github/callback?code=<github_code>&state=<signed_state>
-
-3. The callback handler:
-   a. Verifies the signed state (contains user_id + timestamp + HMAC).
-   b. Exchanges the code for a GitHub access token via httpx.
-   c. Fetches the authenticated GitHub user's login and ID.
-   d. Upserts the token record in Supabase (on_conflict=user_id).
-   e. Redirects the browser to the frontend success URL.
-
-State parameter security
-────────────────────────
-The OAuth state is a Base64-encoded JSON blob signed with HMAC-SHA256
-(keyed on API_KEY_SECRET).  This prevents CSRF: a forged callback with a
-tampered state will fail HMAC verification.  The state also carries a
-15-minute expiry timestamp.
+Account-level actions require a signed-in session (JWT); an API key can
+never create keys or delete an account.
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
-import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List
+from uuid import UUID
 
-import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.api.dependencies import require_current_user
-from app.auth.api_keys import generate_api_key, mask_key_for_logging
+from app.api.dependencies import require_jwt_user
+from app.auth.api_keys import generate_api_key, webhook_url_for
 from app.core.config import settings
+from app.core.errors import DatabaseError
 from app.core.logging import get_logger
-from app.services.crypto import encrypt_token
+from app.core.rate_limit import user_rate_limit
+from app.schemas.account import ApiKeyCreateRequest, ProfileUpdateRequest
+from app.services import supabase as db
 
 logger = get_logger(__name__)
 
 router = APIRouter()
 
 
-class RepoSelectRequest(BaseModel):
-    repo_name: str
-
-_GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
-_GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
-_GITHUB_USER_URL = "https://api.github.com/user"
-_GITHUB_SCOPES = "repo,read:user"
-_STATE_TTL_SECONDS = 900   # 15 minutes
-
-
-class ProfileUpdateRequest(BaseModel):
-    full_name: str
- 
-class BranchSelectRequest(BaseModel):
-    branch_name: str
+def _unavailable(action: str) -> HTTPException:
+    return HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, f"Could not {action} right now. Please try again.")
 
 
 # ================================================================== #
-# API key management                                                   #
+# Profile & status                                                     #
 # ================================================================== #
 
-@router.post(
-    "/api-keys",
-    status_code=status.HTTP_201_CREATED,
-    summary="Generate a new API key",
-)
-async def create_api_key(
-    user_id: str = Depends(require_current_user),
-) -> Dict[str, Any]:
-    """
-    Generate a new API key for the authenticated user.
-
-    The raw key is returned **once only** — it is never stored in the
-    database and cannot be recovered after this response.  Store it
-    immediately in a secrets manager.
-
-    Returns:
-        ``raw_key``    — the secret; show to user once and discard.
-        ``key_prefix`` — first 10 chars; safe to display in dashboards.
-    """
-    raw_key, hashed_key = generate_api_key()
+@router.get("/me", summary="Current user, onboarding and integration status")
+def get_me(user_id: str = Depends(require_jwt_user)) -> Dict[str, Any]:
+    from app.core.llm import configured_agents
 
     try:
-        from app.services.supabase import get_supabase
+        profile = db.get_profile(user_id) or {}
+        github = db.get_github_row(user_id) or {}
+        default_repo = db.get_default_mapping(user_id) or {}
+        sentry = db.get_sentry_integration(user_id) or {}
+        active_keys = db.count_active_api_keys(user_id)
+    except DatabaseError:
+        raise _unavailable("load your account")
 
-        response = (
-            get_supabase()
-            .table("api_keys")
-            .insert({
-                "user_id": user_id,
-                "api_key": hashed_key,
-                "key_prefix": raw_key[:12],
-            })
-            .execute()
-        )
-        rows = response.data or []
-        if not rows:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to persist API key.",
-            )
-        key_id = rows[0].get("id")
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(
-            "create_api_key: DB error | user_id=%s | error=%s", user_id, exc
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create API key.",
-        )
-
-    logger.info(
-        "create_api_key: new key created | user_id=%s | key_prefix=%s",
-        user_id,
-        mask_key_for_logging(raw_key),
-    )
-
-    return {
-        "id": key_id,
-        "raw_key": raw_key,          # shown once only
-        "key_prefix": raw_key[:10],  # safe to cache
-        "message": (
-            "Store this key immediately — it will not be shown again. "
-            "Use it as: X-API-Key: <raw_key>  or  ?key=<raw_key>"
-        ),
-    }
-
-# ================================================================== #
-# GitHub repo selection                                                #
-# ================================================================== #
-
-@router.post(
-    "/github/repo",
-    summary="Set the GitHub repository for incident auto-fix PRs",
-)
-async def set_github_repo(
-    body: RepoSelectRequest,
-    user_id: str = Depends(require_current_user),
-) -> Dict[str, Any]:
-    """
-    Store (or update) the GitHub repo that TrueAI will target when
-    opening automated fix pull requests.
-
-    The repo_name must be in the form ``owner/repo``.
-    """
-    repo_name = body.repo_name.strip()
-
-    # ---- Validate format ----------------------------------------- #
-    parts = repo_name.split("/")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="repo_name must be in the form 'owner/repo' with both sides non-empty.",
-        )
-
-    # ---- Ensure GitHub is connected ------------------------------ #
+    github_connected = bool(github.get("access_token"))
     try:
-        from app.services.supabase import get_github_token, store_github_token
-        from app.services.supabase import get_supabase
-
-        # Fetch current token row so we can preserve existing_token + username
-        client = get_supabase()
-        gh_response = (
-            client.table("github_tokens")
-            .select("access_token, github_username")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = gh_response.data or []
-    except Exception as exc:
-        logger.error("set_github_repo: DB error | user_id=%s | error=%s", user_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch GitHub connection status.",
-        )
-
-    if not rows:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Connect GitHub first via GET /auth/github/authorize.",
-        )
-
-    existing_token: str = rows[0]["access_token"]
-    existing_username: str = rows[0].get("github_username", "")
-
-    # ---- Upsert token row with repo_name ------------------------- #
-    try:
-        store_github_token({
-            "user_id": user_id,
-            "access_token": existing_token,
-            "github_username": existing_username,
-            "repo_name": repo_name,
-        })
-    except Exception as exc:
-        logger.error("set_github_repo: upsert error | user_id=%s | error=%s", user_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to save repository selection.",
-        )
-
-    logger.info("set_github_repo: repo set | user_id=%s | repo=%s", user_id, repo_name)
-    return {"status": "ok", "repo_name": repo_name}
-
-
-# ================================================================== #
-# User profile                                                         #
-# ================================================================== #
-
-@router.post(
-    "/profile",
-    summary="Save user profile info",
-)
-async def update_profile(
-    body: ProfileUpdateRequest,
-    user_id: str = Depends(require_current_user),
-) -> Dict[str, Any]:
-    """
-    Save the user's full name to their profile in Supabase.
-    """
-    full_name = body.full_name.strip()
- 
-    if not full_name:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="full_name cannot be empty.",
-        )
- 
-    if len(full_name) > 100:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="full_name must be 100 characters or fewer.",
-        )
- 
-    try:
-        from app.services.supabase import get_supabase
- 
-        response = (
-            get_supabase()
-            .table("user_profiles")
-            .upsert({
-                "user_id": user_id,
-                "full_name": full_name,
-            }, on_conflict="user_id")
-            .execute()
-        )
- 
-    except Exception as exc:
-        logger.error("update_profile: DB error | user_id=%s | error=%s", user_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to save profile.",
-        )
- 
-    logger.info("update_profile: saved | user_id=%s | name=%s", user_id, full_name)
-    return {"status": "ok", "full_name": full_name}
- 
-
-# ================================================================== #
-# GitHub branch                                                        #
-# ================================================================== #
-
-@router.post(
-    "/github/branch",
-    summary="Set the production branch for the connected repository",
-)
-async def set_github_branch(
-    body: BranchSelectRequest,
-    user_id: str = Depends(require_current_user),
-) -> Dict[str, Any]:
-    """
-    Store (or update) the production branch TrueAI will use when
-    analyzing incidents and opening fix PRs.
-    """
-    branch_name = body.branch_name.strip()
- 
-    if not branch_name:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="branch_name cannot be empty.",
-        )
- 
-    # Ensure GitHub is connected and repo is set first
-    try:
-        from app.services.supabase import get_supabase
- 
-        gh_response = (
-            get_supabase()
-            .table("github_tokens")
-            .select("github_username, repo_name")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = gh_response.data or []
- 
-    except Exception as exc:
-        logger.error("set_github_branch: DB error | user_id=%s | error=%s", user_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch GitHub connection status.",
-        )
- 
-    if not rows:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Connect GitHub and set a repository first.",
-        )
- 
-    if not rows[0].get("repo_name"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Set a repository first via POST /auth/github/repo.",
-        )
- 
-    # Save branch to github_tokens row
-    try:
-        from app.services.supabase import get_supabase
- 
-        (
-            get_supabase()
-            .table("github_tokens")
-            .update({"branch_name": branch_name})
-            .eq("user_id", user_id)
-            .execute()
-        )
- 
-    except Exception as exc:
-        logger.error("set_github_branch: update error | user_id=%s | error=%s", user_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to save branch.",
-        )
- 
-    logger.info("set_github_branch: saved | user_id=%s | branch=%s", user_id, branch_name)
-    return {"status": "ok", "branch_name": branch_name}
-
-
-
-# ================================================================== #
-# Webhook URL helper                                                   #
-# ================================================================== #
-
-@router.get(
-    "/user/webhook-url",
-    summary="Get your personalised Sentry webhook URL",
-)
-async def get_webhook_url(
-    user_id: str = Depends(require_current_user),
-) -> Dict[str, Any]:
-    """
-    Return a ready-to-use Sentry webhook URL containing the user's
-    API key prefix.  The full key is never exposed — only the prefix
-    stored in the DB at key-creation time.
-    """
-    try:
-        from app.services.supabase import get_supabase
-
-        response = (
-            get_supabase()
-            .table("api_keys")
-            .select("key_prefix")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = response.data or []
-    except Exception as exc:
-        logger.error("get_webhook_url: DB error | user_id=%s | error=%s", user_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch API key.",
-        )
-
-    if not rows:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No API key found. Generate one via POST /auth/api-keys first.",
-        )
-
-    key_prefix: str = rows[0].get("key_prefix", "")
-    webhook_url = f"{settings.BASE_URL}/webhook/sentry?key={key_prefix}..."
-
-    return {
-        "webhook_url": webhook_url,
-        "key_prefix": key_prefix,
-    }
-
-@router.delete(
-    "/api-keys/{key_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Revoke an API key",
-)
-async def revoke_api_key(
-    key_id: str,
-    user_id: str = Depends(require_current_user),
-) -> None:
-    """
-    Revoke (soft-delete) an API key by setting is_active = False.
-
-    The key record is retained for audit purposes.  Future requests using
-    this key will receive 401.
-    """
-    try:
-        from app.services.supabase import get_supabase
-
-        response = (
-            get_supabase()
-            .table("api_keys")
-            .update({"is_active": False})
-            .eq("api_key", key_id)
-            .eq("user_id", user_id)
-            .execute()
-        )
-        rows = response.data or []
-        if not rows:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"API key {key_id} not found or not owned by you.",
-            )
-
-        logger.info(
-            "revoke_api_key: key_id=%s revoked | user_id=%s", key_id, user_id
-        )
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(
-            "revoke_api_key: DB error | key_id=%s | error=%s", key_id, exc
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to revoke API key.",
-        )
-
-
-# ================================================================== #
-# Delete account                                                       #
-# ================================================================== #
-
-@router.delete(
-    "/account",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete the authenticated user's account",
-)
-async def delete_account(
-    user_id: str = Depends(require_current_user),
-) -> None:
-    """
-    Permanently delete the authenticated user's account and all associated data.
-    This action is irreversible.
-    """
-    try:
-        from app.services.supabase import get_supabase
-        from supabase import create_client
-        from app.core.config import settings as app_settings
-
-        # Need service role client to delete auth users
-        admin_client = create_client(
-            app_settings.SUPABASE_URL,
-            app_settings.SUPABASE_SERVICE_ROLE_KEY
-        )
-
-        # Delete the user from Supabase Auth (cascades to all tables via FK)
-        admin_client.auth.admin.delete_user(user_id)
-
-        logger.info("delete_account: user deleted | user_id=%s", user_id)
-
-    except Exception as exc:
-        logger.error("delete_account: error | user_id=%s | error=%s", user_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete account.",
-        )
-
-
-# ================================================================== #
-# GitHub OAuth                                                         #
-# ================================================================== #
-
-@router.get(
-    "/github/authorize",
-    summary="Begin GitHub OAuth flow",
-)
-async def github_authorize(
-    redirect_uri: Optional[str] = Query(
-        default=None,
-        description="Frontend URL to redirect to after OAuth completes.",
-    ),
-    user_id: str = Depends(require_current_user),
-) -> Dict[str, str]:
-    """
-    Return the GitHub OAuth authorisation URL.
-
-    The client must redirect the browser to ``auth_url``.  After the user
-    grants access, GitHub redirects to /auth/github/callback.
-    """
-    state = _encode_oauth_state(user_id=user_id, redirect_uri=redirect_uri)
-
-    params = {
-        "client_id": settings.GITHUB_CLIENT_ID,
-        "scope": _GITHUB_SCOPES,
-        "state": state,
-        "redirect_uri": f"{settings.BASE_URL}/auth/github/callback",
-    }
-    query_string = "&".join(f"{k}={v}" for k, v in params.items())
-    auth_url = f"{_GITHUB_AUTHORIZE_URL}?{query_string}"
-
-    logger.info(
-        "github_authorize: initiated | user_id=%s", user_id
-    )
-    return {"auth_url": auth_url}
-
-
-@router.get(
-    "/github/callback",
-    summary="Complete GitHub OAuth flow",
-)
-async def github_callback(
-    code: Optional[str] = Query(default=None),
-    state: Optional[str] = Query(default=None),
-    error: Optional[str] = Query(default=None),
-    error_description: Optional[str] = Query(default=None),
-) -> RedirectResponse:
-    """
-    Handle the GitHub OAuth callback.
-
-    Exchanges the authorisation code for an access token, fetches the
-    user's GitHub profile, stores the token in Supabase, and redirects
-    the browser to the configured frontend URL.
-    """
-    # ---- GitHub returned an error ---------------------------------- #
-    if error:
-        logger.warning(
-            "github_callback: GitHub returned error '%s': %s",
-            error,
-            error_description,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"GitHub OAuth error: {error_description or error}",
-        )
-
-    if not code or not state:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing 'code' or 'state' query parameters.",
-        )
-
-    # ---- Verify state -------------------------------------------- #
-    state_data = _decode_oauth_state(state)
-    if state_data is None:
-        logger.warning("github_callback: invalid or expired OAuth state.")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OAuth state is invalid or expired. Please try again.",
-        )
-
-    user_id: str = state_data["user_id"]
-    redirect_uri: Optional[str] = state_data.get("redirect_uri")
-
-    # ---- Exchange code for access token -------------------------- #
-    access_token, token_scope = await _exchange_github_code(code)
-    if not access_token:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Failed to obtain GitHub access token.",
-        )
-
-    # ---- Fetch GitHub user profile ------------------------------- #
-    github_username, github_user_id = await _fetch_github_user(access_token)
-    if not github_username:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Failed to fetch GitHub user profile.",
-        )
-
-    # ---- Persist token ------------------------------------------ #
-    try:
-        from app.services.supabase import store_github_token
-
-        store_github_token({
-            "user_id": user_id,
-            "access_token": encrypt_token(access_token),
-            "github_username": github_username,
-        })
-    except Exception as exc:
-        logger.error(
-            "github_callback: failed to store token | user_id=%s | error=%s",
-            user_id,
-            exc,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="GitHub authentication succeeded but token storage failed.",
-        )
-
-    logger.info(
-        "github_callback: token stored | user_id=%s | github_username=%s...",
-        user_id,
-        github_username[:4] if len(github_username) >= 4 else "****",
-    )
-
-    # ---- Redirect to frontend ------------------------------------ #
-    destination = redirect_uri or settings.BASE_URL
-    return RedirectResponse(
-        url=f"{destination}?github_connected=true",
-        status_code=status.HTTP_302_FOUND,
-    )
-
-
-# ================================================================== #
-# Current user info                                                    #
-# ================================================================== #
-
-@router.get(
-    "/me",
-    summary="Get authenticated user info",
-)
-async def get_me(
-    user_id: str = Depends(require_current_user),
-) -> Dict[str, Any]:
-    """Return basic profile info for the authenticated user."""
-    try:
-        from app.services.supabase import get_supabase
-
-        client = get_supabase()
-
-        # Check GitHub connection
-        gh_response = (
-            client.table("github_tokens")
-            .select("github_username, repo_name, branch_name, created_at")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        github_row = (gh_response.data or [None])[0]
-
-        # Check user profile
-        profile_response = (
-            client.table("user_profiles")
-            .select("full_name")
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
-        profile_row = (profile_response.data or [None])[0]
-
-        return {
-            "user_id": user_id,
-            "full_name": (profile_row or {}).get("full_name"),
-            "github_connected": github_row is not None,
-            "github_username": (github_row or {}).get("github_username"),
-            "github_repo": (github_row or {}).get("repo_name"),
-            "github_branch": (github_row or {}).get("branch_name"),
-        }
-
-    except Exception as exc:
-        logger.error("get_me: error | user_id=%s | error=%s", user_id, exc)
-        return {"user_id": user_id, "github_connected": False}
-
-
-# ================================================================== #
-# OAuth state helpers                                                  #
-# ================================================================== #
-
-def _encode_oauth_state(user_id: str, redirect_uri: Optional[str] = None) -> str:
-    """
-    Return a signed, Base64-encoded JSON blob for use as the OAuth state.
-
-    Format: base64url(json) + "." + hmac_prefix_16_chars
-    """
-    payload = {
-        "user_id": user_id,
-        "ts": int(time.time()),
-        "redirect_uri": redirect_uri,
-    }
-    raw = json.dumps(payload, separators=(",", ":"))
-    encoded = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-    sig = hmac.new(
-        settings.API_KEY_SECRET.encode("utf-8"),
-        encoded.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()[:32]
-    return f"{encoded}.{sig}"
-
-
-def _decode_oauth_state(state: str) -> Optional[Dict[str, Any]]:
-    """
-    Verify and decode an OAuth state string.
-
-    Returns the payload dict or None if the signature is invalid, the
-    timestamp is expired, or the string is malformed.
-    """
-    try:
-        encoded, sig = state.rsplit(".", 1)
-        expected_sig = hmac.new(
-            settings.API_KEY_SECRET.encode("utf-8"),
-            encoded.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()[:32]
-
-        if not hmac.compare_digest(sig, expected_sig):
-            return None
-
-        # Re-pad Base64
-        padding = 4 - len(encoded) % 4
-        padded = encoded + "=" * (padding % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded).decode())
-
-        if time.time() - payload.get("ts", 0) > _STATE_TTL_SECONDS:
-            return None
-
-        return payload
-
+        agents = configured_agents()
     except Exception:
-        return None
+        agents = {}
+    return {
+        "user_id": user_id,
+        "full_name": profile.get("full_name"),
+        "github_connected": github_connected,
+        "github_username": github.get("github_username") if github_connected else None,
+        "github_repo": default_repo.get("repo_full_name"),
+        "github_branch": default_repo.get("branch"),
+        "has_api_key": active_keys > 0,
+        "sentry": {
+            "org_slug": sentry.get("org_slug"),
+            "has_auth_token": bool(sentry.get("auth_token_enc")),
+            "has_webhook_secret": bool(sentry.get("webhook_secret_enc")),
+        },
+        "onboarding_complete": bool(profile.get("full_name") and github_connected and default_repo and active_keys > 0),
+        "agents": agents,
+        "auto_pr_threshold": settings.CONFIDENCE_AUTO_PR_THRESHOLD,
+    }
+
+
+@router.post("/profile", summary="Save display name")
+def update_profile(body: ProfileUpdateRequest, user_id: str = Depends(require_jwt_user)) -> Dict[str, Any]:
+    try:
+        db.upsert_profile(user_id, body.full_name)
+    except DatabaseError:
+        raise _unavailable("save your profile")
+    return {"status": "ok", "full_name": body.full_name}
+
+
+@router.delete("/account", status_code=status.HTTP_204_NO_CONTENT, summary="Delete account and all data")
+def delete_account(
+    user_id: str = Depends(require_jwt_user),
+    _limit: None = Depends(user_rate_limit("delete-account", 5, 3600)),
+) -> None:
+    from app.services.github.client import load_connection, revoke_oauth_grant
+
+    try:
+        connection = load_connection(user_id)
+        if connection:
+            revoke_oauth_grant(connection.token)
+        db.delete_user_data(user_id)
+        db.delete_auth_user(user_id)
+    except DatabaseError:
+        raise _unavailable("delete your account")
+    logger.info("delete_account: account deleted | user_id=%s", user_id)
 
 
 # ================================================================== #
-# GitHub API helpers                                                   #
+# API keys                                                             #
 # ================================================================== #
 
-async def _exchange_github_code(code: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Exchange an OAuth authorisation code for a GitHub access token.
+@router.get("/api-keys", summary="List API keys")
+def list_api_keys(user_id: str = Depends(require_jwt_user)) -> List[Dict[str, Any]]:
+    try:
+        return db.list_api_keys(user_id)
+    except DatabaseError:
+        raise _unavailable("load your API keys")
 
-    Returns (access_token, scope) or (None, None) on failure.
+
+@router.post("/api-keys", status_code=status.HTTP_201_CREATED, summary="Create an API key")
+def create_api_key(
+    body: ApiKeyCreateRequest = ApiKeyCreateRequest(),
+    user_id: str = Depends(require_jwt_user),
+    _limit: None = Depends(user_rate_limit("create-api-key", 20, 3600)),
+) -> Dict[str, Any]:
+    try:
+        if db.count_active_api_keys(user_id) >= settings.MAX_ACTIVE_API_KEYS:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"You already have {settings.MAX_ACTIVE_API_KEYS} active keys. Revoke one before creating another.",
+            )
+        raw_key, hashed_key, prefix = generate_api_key()
+        row = db.insert_api_key(user_id, hashed_key, prefix, body.name)
+    except DatabaseError:
+        raise _unavailable("create an API key")
+
+    logger.info("create_api_key: key created | user_id=%s | prefix=%s", user_id, prefix)
+    return {
+        "id": row["id"],
+        "name": row.get("name"),
+        "key_prefix": prefix,
+        "created_at": row.get("created_at"),
+        "raw_key": raw_key,
+        "webhook_url": webhook_url_for(raw_key),
+        "message": "Copy this now — the key cannot be shown again.",
+    }
+
+
+@router.delete("/api-keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Revoke an API key")
+def revoke_api_key(key_id: UUID, user_id: str = Depends(require_jwt_user)) -> None:
+    try:
+        revoked = db.revoke_api_key(user_id, str(key_id))
+    except DatabaseError:
+        raise _unavailable("revoke the key")
+    if not revoked:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "API key not found.")
+    logger.info("revoke_api_key: revoked | user_id=%s | key_id=%s", user_id, key_id)
+
+
+@router.get("/user/webhook-url", summary="Sentry webhook endpoint details")
+def get_webhook_url(user_id: str = Depends(require_jwt_user)) -> Dict[str, Any]:
+    """
+    The complete webhook URL embeds a secret key, which is only ever shown
+    when the key is created.  This endpoint returns the base URL and whether
+    an active key exists, so the dashboard can guide the user.
     """
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                _GITHUB_TOKEN_URL,
-                data={
-                    "client_id": settings.GITHUB_CLIENT_ID,
-                    "client_secret": settings.GITHUB_CLIENT_SECRET,
-                    "code": code,
-                    "redirect_uri": f"{settings.BASE_URL}/auth/github/callback",
-                },
-                headers={"Accept": "application/json"},
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        if "error" in data:
-            logger.error(
-                "_exchange_github_code: GitHub error '%s': %s",
-                data.get("error"),
-                data.get("error_description"),
-            )
-            return None, None
-
-        return data.get("access_token"), data.get("scope")
-
-    except Exception as exc:
-        logger.error("_exchange_github_code: request failed: %s", exc)
-        return None, None
-
-
-async def _fetch_github_user(
-    access_token: str,
-) -> tuple[Optional[str], Optional[int]]:
-    """
-    Fetch the authenticated GitHub user's login and numeric ID.
-
-    Returns (username, user_id) or (None, None) on failure.
-    The access_token is never logged.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                _GITHUB_USER_URL,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Accept": "application/vnd.github+json",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        return data.get("login"), data.get("id")
-
-    except Exception as exc:
-        logger.error("_fetch_github_user: request failed: %s", exc)
-        return None, None
+        keys = [k for k in db.list_api_keys(user_id) if k.get("is_active")]
+    except DatabaseError:
+        raise _unavailable("load webhook details")
+    return {
+        "webhook_base_url": f"{settings.BASE_URL}/webhook/sentry",
+        "has_active_key": bool(keys),
+        "key_prefix": keys[0]["key_prefix"] if keys else None,
+    }
