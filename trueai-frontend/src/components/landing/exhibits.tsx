@@ -33,12 +33,7 @@ function Marker({ n, className }: { n: number; className?: string }) {
   )
 }
 
-const ANSWER_NOTES = [
-  { title: 'What went wrong, in plain English', body: 'The root cause, traced to the line in your code, with how sure TrueAI is.' },
-  { title: 'The smallest change that fixes it', body: 'One precise edit, checked for syntax and safety before anyone sees it.' },
-  { title: 'A second opinion', body: 'Every fix is double-checked before it reaches you, and sent back if it is not right.' },
-  { title: 'Waiting for you on GitHub', body: 'A pull request with the whole story. You review it and merge it, as usual.' },
-]
+const ANSWER_NOTES = ['What went wrong, in plain English', 'The smallest change that fixes it', 'A second opinion', 'A pull request, waiting for you']
 
 export function AnswerExhibit() {
   return (
@@ -64,8 +59,7 @@ export function AnswerExhibit() {
             <div className="min-w-0">
               <p className="text-[0.75rem] text-ink-3">Root cause · 96% confidence</p>
               <p className="mt-1 max-w-[52ch] text-[1.125rem] font-semibold leading-snug tracking-[-0.01em] text-ink">
-                order_total passes the optional “discount” parameter straight to int(), and it is missing whenever a customer
-                checks out without a code.
+                order_total passes “discount” straight to int(), and it is missing when a customer has no code.
               </p>
             </div>
           </div>
@@ -100,8 +94,8 @@ export function AnswerExhibit() {
             <div className="flex min-w-0 flex-1 items-start gap-3 rounded-lg bg-fixed-tint px-4 py-3">
               <Check className="mt-0.5 size-4 shrink-0 text-fixed" strokeWidth={2.5} aria-hidden />
               <p className="text-[0.8125rem] leading-relaxed text-ink-2">
-                <span className="font-semibold text-ink">Double-checked and approved · 92%.</span> A default of “0” means int() never
-                sees a missing value, and real discount codes work exactly as before.
+                <span className="font-semibold text-ink">Double-checked and approved · 92%.</span> Real discount codes work exactly as
+                before.
               </p>
             </div>
           </div>
@@ -112,14 +106,11 @@ export function AnswerExhibit() {
         </figcaption>
       </figure>
 
-      <ol className="grid content-start gap-x-8 gap-y-6 sm:grid-cols-2 lg:grid-cols-1 lg:pt-6">
+      <ol className="grid content-start gap-x-8 gap-y-5 sm:grid-cols-2 lg:grid-cols-1 lg:pt-6">
         {ANSWER_NOTES.map((note, index) => (
-          <li key={note.title} className="flex gap-3">
+          <li key={note} className="flex gap-3">
             <Marker n={index + 1} className="mt-0.5" />
-            <div>
-              <p className="text-[0.9375rem] font-semibold text-ink">{note.title}</p>
-              <p className="mt-1 text-[0.875rem] leading-relaxed text-ink-2">{note.body}</p>
-            </div>
+            <p className="text-[0.9375rem] font-semibold text-ink">{note}</p>
           </li>
         ))}
       </ol>
@@ -128,10 +119,9 @@ export function AnswerExhibit() {
 }
 
 const HANDOVER_STEPS = [
-  'Check that PostgreSQL is running on db.internal (10.0.0.5), and start it if it has stopped.',
-  'Confirm it listens on port 5432 on that address, not only on localhost.',
-  'From an app host, run nc -zv db.internal 5432; open the firewall rule if it is blocked.',
-  'Once it connects, restart the service and load the orders page to confirm.',
+  'Check that PostgreSQL is running on db.internal.',
+  'Confirm it listens on port 5432, not only on localhost.',
+  'Restart the service and load the orders page to confirm.',
 ]
 
 export function HandoverExhibit() {

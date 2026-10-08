@@ -117,7 +117,7 @@ export function ExampleReport({ className, compact = false }: { className?: stri
         </div>
       </div>
       <figcaption id={captionId} className="border-t border-rule px-5 py-2.5 text-[0.75rem] text-ink-3">
-        Example — a real TrueAI analysis from a test run. Repository name changed.
+        Example: a real TrueAI analysis from a test run. Repository name changed.
       </figcaption>
     </figure>
   )

@@ -40,9 +40,13 @@ function LoginForm() {
 
   async function submit(event: FormEvent) {
     event.preventDefault()
+    setUnconfirmed(false)
+    if (!email.trim() || !password) {
+      setError('Enter your email and password.')
+      return
+    }
     setPending(true)
     setError(null)
-    setUnconfirmed(false)
     const supabase = createClient()
     const { error: authError } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
     if (authError) {
@@ -99,12 +103,12 @@ function LoginForm() {
           </div>
           <PasswordInput id="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} />
         </div>
-        <Button type="submit" size="lg" className="w-full" loading={pending} disabled={!email.trim() || !password}>
+        <Button type="submit" size="lg" className="w-full" loading={pending}>
           Sign in
         </Button>
       </form>
 
-      <p className="mt-6 text-sm text-ink-2">
+      <p className="mt-7 border-t border-rule pt-5 text-center text-sm text-ink-2">
         New to TrueAI?{' '}
         <Link href="/signup" className="font-medium text-ink underline underline-offset-4">
           Create an account

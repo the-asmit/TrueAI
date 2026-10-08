@@ -38,10 +38,11 @@
   --color-stage: var(--stage);
   --color-stage-ink: var(--stage-ink);
   --color-stage-ink-2: var(--stage-ink-2);
-  /* State colours on the dark stage are the same in both themes. */
-  --color-stage-fixed: #56c98f;
-  --color-stage-failure: #ff7e6f;
-  --color-stage-human: #e6b04d;
+  --color-stage-fixed: var(--fixed);
+  --color-stage-failure: var(--failure);
+  --color-stage-human: var(--human);
+  --color-night: var(--night);
+  --color-night-ink: var(--night-ink);
 
   --color-diff-add: var(--diff-add);
   --color-diff-add-ink: var(--diff-add-ink);
@@ -88,10 +89,17 @@
   --diff-del: #fdecea;
   --diff-del-ink: #8a1c12;
 
-  /* The landing hero's night: the on-call hour the queue plays out in. */
-  --stage: #121417;
-  --stage-ink: #ecebe6;
-  --stage-ink-2: #a3a8af;
+  /* The landing page's stage (its header and hero) follows the theme. */
+  --stage: #f1f1ec;
+  --stage-ink: #121417;
+  --stage-ink-2: #3a3e45;
+  /* The landing page's closing band stays dark in both themes. */
+  --night: #121417;
+  --night-ink: #ecebe6;
+
+  /* Which theme-toggle icon shows: the one for the theme a click switches to. */
+  --light-only: block;
+  --dark-only: none;
 }
 
 /* ---- Dark: graphite, for night on-call ------------------------------------ */
@@ -128,6 +136,11 @@
     --stage: #060708;
     --stage-ink: #ecebe6;
     --stage-ink-2: #8e939a;
+    --night: #060708;
+    --night-ink: #ecebe6;
+
+    --light-only: none;
+    --dark-only: block;
   }
 }
 
@@ -163,6 +176,11 @@
   --stage: #060708;
   --stage-ink: #ecebe6;
   --stage-ink-2: #8e939a;
+  --night: #060708;
+  --night-ink: #ecebe6;
+
+  --light-only: none;
+  --dark-only: block;
 }
 
 @layer base {
@@ -291,69 +309,52 @@
   }
 }
 
-/* ---- Landing hero: errors stream toward the viewer and turn into fixes at the scan line ---- */
-.fix-stream-viewport {
-  perspective: 1500px;
-  perspective-origin: 50% 0%;
-  /* Fade the plane out at the far edge and at both sides (mask alpha only; the colour is irrelevant). */
-  mask-image: linear-gradient(to bottom, transparent 0%, #000 34%, #000 90%, transparent 100%),
-    linear-gradient(to right, transparent 0%, #000 16%, #000 84%, transparent 100%);
-  mask-composite: intersect;
-  -webkit-mask-composite: source-in;
+/* ---- Landing hero: one incident at a time moves through a flat, three-part diagram ---- */
+/* A quiet dot grid behind the diagram (and behind the sign-in card), fading out toward its edges. */
+.dot-grid {
+  background-image: radial-gradient(circle, color-mix(in srgb, var(--ink) 15%, transparent) 1px, transparent 1.5px);
+  background-size: 24px 24px;
+  mask-image: radial-gradient(ellipse 72% 78% at 50% 50%, #000 25%, transparent 100%);
 }
-.fix-stream-plane {
-  position: absolute;
-  left: 50%;
-  bottom: -4%;
-  width: 1500px;
-  height: 1150px;
-  transform-origin: 50% 100%;
-  transform: translateX(-50%) rotateX(56deg);
-  /* Where the scan line sits (see fix-stream.tsx): a fraction of the plane's height, 0 = far edge. */
-  --scan: 0.44;
-}
-.stream-col {
-  display: flex;
-  flex-direction: column;
-  animation: stream-down linear infinite;
-  will-change: transform;
-}
-/* Each column holds three identical copies; moving by one copy loops seamlessly. */
-@keyframes stream-down {
-  from {
-    transform: translateY(-33.3333%);
-  }
-  to {
-    transform: translateY(0);
-  }
-}
-.fix-stream[data-paused="true"] .stream-col {
-  animation-play-state: paused;
-}
-.stream-card {
-  height: 92px;
-  margin-bottom: 18px; /* spacing via margin (not gap) keeps each copy exactly a third of the column */
-  padding: 14px 16px;
-  border-width: 1px;
-  border-radius: 8px;
+/* The line between two parts of the diagram. It fills with ink as the work moves along it:
+   left to right on wide screens, top to bottom when the diagram is stacked. The setup steps
+   reuse it as a progress bar, setting --flow-from, --flow-time and --flow-ease themselves. */
+.flow-link {
+  position: relative;
   overflow: hidden;
+  background: var(--rule-strong);
+  --flow-from: translateY(-101%);
 }
-.fix-stream-scan {
-  position: absolute;
-  inset-inline: 0;
-  height: 2px;
-  margin-top: -1px;
-  background: var(--color-stage-fixed);
-  box-shadow: 0 0 14px 1px color-mix(in srgb, var(--color-stage-fixed) 55%, transparent),
-    0 0 60px 6px color-mix(in srgb, var(--color-stage-fixed) 12%, transparent);
-}
-@media (max-width: 639px) {
-  .fix-stream-plane {
-    width: 620px;
-    height: 1000px;
-    transform: translateX(-50%) rotateX(52deg);
-    --scan: 0.6;
+@media (min-width: 1024px) {
+  .flow-link {
+    --flow-from: translateX(-101%);
   }
+}
+.flow-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--ink);
+  transform: var(--flow-from);
+}
+.flow-link[data-state="active"]::after {
+  animation: flow-run var(--flow-time, 700ms) var(--flow-ease, var(--ease-out-expo)) forwards;
+}
+.flow-link[data-state="done"]::after {
+  transform: none;
+}
+@keyframes flow-run {
+  to {
+    transform: none;
+  }
+}
+/* The fix is written into the code from left to right. */
+.flow-wipe {
+  clip-path: inset(0 100% 0 0);
+}
+.flow-wipe[data-on="true"] {
+  clip-path: inset(0);
+  transition: clip-path 650ms linear;
 }
 
 /* Landing page figures set into place as they scroll into view. Visible by

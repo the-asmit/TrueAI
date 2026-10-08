@@ -17,6 +17,10 @@ export default function ForgotPasswordPage() {
 
   async function submit(event: FormEvent) {
     event.preventDefault()
+    if (!email.trim()) {
+      setError('Enter your email.')
+      return
+    }
     setPending(true)
     setError(null)
     const supabase = createClient()
@@ -58,11 +62,11 @@ export default function ForgotPasswordPage() {
             <Field id="email" label="Email">
               <Input id="email" type="email" autoComplete="email" inputMode="email" required value={email} onChange={(event) => setEmail(event.target.value)} />
             </Field>
-            <Button type="submit" size="lg" className="w-full" loading={pending} disabled={!email.trim()}>
+            <Button type="submit" size="lg" className="w-full" loading={pending}>
               Send reset link
             </Button>
           </form>
-          <p className="mt-6 text-sm text-ink-2">
+          <p className="mt-7 border-t border-rule pt-5 text-center text-sm text-ink-2">
             Remembered it?{' '}
             <Link href="/login" className="font-medium text-ink underline underline-offset-4">
               Sign in

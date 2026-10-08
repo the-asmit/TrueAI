@@ -22,6 +22,10 @@ export default function SignUpPage() {
 
   async function submit(event: FormEvent) {
     event.preventDefault()
+    if (!email.trim()) {
+      setError('Enter your email.')
+      return
+    }
     if (password.length < 8) {
       setError('Use at least 8 characters for your password.')
       return
@@ -92,12 +96,12 @@ export default function SignUpPage() {
             aria-invalid={tooShort || undefined}
           />
         </Field>
-        <Button type="submit" size="lg" className="w-full" loading={pending} disabled={!email.trim() || password.length < 8}>
+        <Button type="submit" size="lg" className="w-full" loading={pending}>
           Create account
         </Button>
       </form>
 
-      <p className="mt-6 text-sm text-ink-2">
+      <p className="mt-7 border-t border-rule pt-5 text-center text-sm text-ink-2">
         Already have an account?{' '}
         <Link href="/login" className="font-medium text-ink underline underline-offset-4">
           Sign in

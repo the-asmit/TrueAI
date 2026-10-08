@@ -27,7 +27,7 @@ export function PasswordInput(props: Omit<ComponentProps<'input'>, 'type'>) {
 export function friendlyAuthError(message: string): string {
   const text = message.toLowerCase()
   if (text.includes('invalid login credentials')) return 'Email or password is incorrect.'
-  if (text.includes('email not confirmed')) return 'Confirm your email first — use the link we sent when you signed up.'
+  if (text.includes('email not confirmed')) return 'Confirm your email first, using the link we sent when you signed up.'
   if (text.includes('already registered') || text.includes('already been registered')) return 'An account with this email already exists. Sign in instead.'
   if (text.includes('password should be')) return 'Use at least 8 characters for your password.'
   if (text.includes('same as the old password') || text.includes('should be different')) return 'Choose a password different from your current one.'

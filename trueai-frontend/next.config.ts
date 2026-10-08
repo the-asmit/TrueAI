@@ -16,6 +16,9 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   reactStrictMode: true,
   output: 'standalone',
+  // Development only: hosts allowed to load the dev server's scripts, so the app can be opened on a phone through
+  // an ngrok tunnel. Without this the page loads but never becomes interactive.
+  allowedDevOrigins: ['*.ngrok-free.dev', '*.ngrok-free.app', '*.ngrok.app', '*.ngrok.io'],
   async headers() {
     return [{ source: '/:path*', headers: securityHeaders }]
   },

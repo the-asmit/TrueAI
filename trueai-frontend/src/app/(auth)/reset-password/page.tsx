@@ -90,7 +90,7 @@ export default function ResetPasswordPage() {
             aria-invalid={tooShort || undefined}
           />
         </Field>
-        <Button type="submit" size="lg" className="w-full" loading={pending} disabled={password.length < 8}>
+        <Button type="submit" size="lg" className="w-full" loading={pending}>
           Save password
         </Button>
       </form>
