@@ -3,16 +3,18 @@ import Link from 'next/link'
 import { cn } from '@/lib/utils'
 
 /*
- * TrueAI mark: an incident's pulse that resolves into a check, on an ink badge.
+ * TrueAI mark: a "T" drawn as a merge. The crossbar is the main branch, the stem is
+ * the fix branch sweeping into it, and the green dot at its base is the fix itself.
  * The colours are fixed (it is a logo, not UI), and the faint edge keeps the badge
- * visible on dark backgrounds. app/icon.svg and app/apple-icon.png use the same drawing.
+ * visible on dark backgrounds. app/icon.svg, app/favicon.ico and app/apple-icon.png
+ * use the same drawing.
  */
 export function Mark({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 32 32" aria-hidden className={cn('size-6 shrink-0', className)}>
       <rect x="0.5" y="0.5" width="31" height="31" rx="8" fill="#121417" stroke="#ffffff" strokeOpacity="0.14" />
-      <path d="M5.5 17.5h3.75l2.5-7" fill="none" stroke="#9aa0a7" strokeWidth="2.75" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M11.75 10.5 15.25 22 26.5 9.75" fill="none" stroke="#56c98f" strokeWidth="2.75" strokeLinecap="round" strokeLinejoin="round" />
+      <path fill="#f1f0eb" d="M8.4 8.3h15.2a1.85 1.85 0 0 1 0 3.7h-.9a5.6 5.6 0 0 0-5.6 5.6v2.6h-3.7V12H8.4a1.85 1.85 0 0 1 0-3.7z" />
+      <circle cx="15.25" cy="22.6" r="3.6" fill="#56c98f" />
     </svg>
   )
 }
