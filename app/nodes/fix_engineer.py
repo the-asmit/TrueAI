@@ -45,7 +45,7 @@ async def fix_engineer_node(state: IncidentState) -> Dict[str, Any]:
     max_attempts = settings.MAX_FIX_ATTEMPTS
     investigation = state.get("investigation") or {}
     agent = FixEngineerAgent()
-    await set_current_step(state, f"{agent.title} (attempt {attempt})")
+    await set_current_step(state, "Writing a fix")
 
     updates: Dict[str, Any] = {"fix_attempts": attempt}
     source_files = dict(state.get("source_files") or {})
@@ -80,17 +80,17 @@ async def fix_engineer_node(state: IncidentState) -> Dict[str, Any]:
         await record_step(state, step="fix_engineer", kind="agent", status="error", summary=str(exc))
         if exc.retryable:
             return {**updates, **failure(f"Fix generation failed: {exc}", retryable=True)}
-        return {**updates, "action": "flag_for_review", "flag_reason": f"The Fix Engineer could not run: {exc}"}
+        return {**updates, "action": "flag_for_review", "flag_reason": f"No fix could be written: {exc}"}
     except AgentOutputError as exc:
         await record_step(state, step="fix_engineer", kind="agent", status="error", summary=str(exc))
-        return {**updates, "action": "flag_for_review", "flag_reason": f"The Fix Engineer's reply was unusable: {exc}"}
+        return {**updates, "action": "flag_for_review", "flag_reason": f"No usable fix could be written: {exc}"}
 
     fix = result.output.model_dump()
     updates["fix"] = fix
     updates["usage"] = add_usage(state, result.input_tokens, result.output_tokens)
 
     if fix.get("cannot_fix"):
-        reason = f"The Fix Engineer concluded no safe code change exists: {fix['cannot_fix']}"
+        reason = f"No safe code change exists: {fix['cannot_fix']}"
         await record_step(state, step="fix_engineer", kind="agent", status="warning", summary=reason, result=result)
         return {**updates, "action": "flag_for_review", "flag_reason": reason}
 
@@ -139,7 +139,7 @@ async def fix_engineer_node(state: IncidentState) -> Dict[str, Any]:
             reason = (
                 "The proposed change was blocked by TrueAI's safety policy: " + "; ".join(violations)
                 if violations and not problems
-                else "The Fix Engineer could not produce a change that applies cleanly: " + "; ".join(problems)
+                else "No change could be written that applies cleanly: " + "; ".join(problems)
             )
             return {**updates, "action": "flag_for_review", "flag_reason": reason[:1500]}
         return updates

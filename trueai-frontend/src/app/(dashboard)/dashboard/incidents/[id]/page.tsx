@@ -8,7 +8,6 @@ import { AutoRefresh } from '@/components/auto-refresh'
 import { DiffView } from '@/components/report/diff-view'
 import { IncidentActions } from '@/components/report/incident-actions'
 import { Prose } from '@/components/report/prose'
-import { Timeline } from '@/components/report/timeline'
 import { ButtonLink } from '@/components/ui/button'
 import { Meta, ReportSection } from '@/components/ui/misc'
 import { Notice } from '@/components/ui/notice'
@@ -53,8 +52,8 @@ export default async function IncidentReportPage({ params }: PageProps<'/dashboa
   if (!incident) notFound()
 
   const active = isActive(incident.status)
-  // Every current run records steps; a finished incident without any predates the agent pipeline.
-  const legacy = !active && incident.status !== 'failed' && incident.steps.length === 0
+  // A finished incident without a report was handled by an earlier version of TrueAI.
+  const legacy = !active && incident.status !== 'failed' && !incident.analysis
   const pr = incident.pull_request
   const sections = buildSections(incident)
 
@@ -123,7 +122,7 @@ export default async function IncidentReportPage({ params }: PageProps<'/dashboa
       {/* ---- Body ---- */}
       <div className="mt-10 space-y-10">
         {active && (
-          <Notice kind="info" title={incident.status === 'queued' ? 'Waiting for an analysis worker' : 'The agents are working on this incident'}>
+          <Notice kind="info" title={incident.status === 'queued' ? 'Waiting to be analysed' : 'TrueAI is working on this incident'}>
             {incident.current_step ? `${incident.current_step}. ` : ''}This page updates by itself; most incidents finish in under a minute.
           </Notice>
         )}
@@ -134,8 +133,7 @@ export default async function IncidentReportPage({ params }: PageProps<'/dashboa
         )}
         {legacy && (
           <Notice kind="info" title="Analysed by an earlier version of TrueAI">
-            This incident was handled before the agent team existed, so it has no timeline{incident.analysis ? '' : ' or report'}. Use “Run analysis
-            again” for a full report from the current agents.
+            This incident has no report. Use “Run analysis again” for a full report.
           </Notice>
         )}
 
@@ -145,12 +143,13 @@ export default async function IncidentReportPage({ params }: PageProps<'/dashboa
           </ReportSection>
         ))}
 
-        <p className="tabular border-t border-rule pt-4 text-[0.75rem] text-ink-3">
-          {incident.attempts > 1 && <>{incident.attempts} attempts · </>}
-          {formatCount((incident.llm_input_tokens ?? 0) + (incident.llm_output_tokens ?? 0))} model tokens
-          {incident.completed_at && <> · completed {formatUtc(incident.completed_at)}</>}
-          {incident.sentry_event_id && <> · Sentry event <span className="font-mono">{incident.sentry_event_id}</span></>}
-        </p>
+        {(incident.completed_at || incident.sentry_event_id) && (
+          <p className="tabular border-t border-rule pt-4 text-[0.75rem] text-ink-3">
+            {incident.completed_at && <>Analysed {formatUtc(incident.completed_at)}</>}
+            {incident.completed_at && incident.sentry_event_id && ' · '}
+            {incident.sentry_event_id && <>Sentry event <span className="font-mono">{incident.sentry_event_id}</span></>}
+          </p>
+        )}
       </div>
     </div>
   )
@@ -220,14 +219,6 @@ function buildSections(incident: IncidentDetail): Section[] {
           <Prose text={analysis.explanation} />
         </p>
       ),
-    })
-  }
-  if (incident.steps.length > 0 || isActive(incident.status)) {
-    sections.push({
-      id: 'timeline',
-      title: 'Timeline',
-      aside: <span className="text-[0.75rem] text-ink-3">Times in UTC</span>,
-      body: <Timeline steps={incident.steps} live={isActive(incident.status)} />,
     })
   }
   if (incident.stack_trace && incident.stack_trace.length > 0) {
@@ -356,7 +347,7 @@ function NextSteps({ analysis }: { analysis: Analysis }) {
           )}
         </dl>
       )}
-      {remediation.fallback && <p className="text-[0.75rem] text-ink-3">Standard checklist — the Remediation Agent was unavailable for this run.</p>}
+      {remediation.fallback && <p className="text-[0.75rem] text-ink-3">A standard checklist: tailored steps could not be written for this run.</p>}
     </div>
   )
 }
@@ -364,7 +355,7 @@ function NextSteps({ analysis }: { analysis: Analysis }) {
 function Review({ analysis }: { analysis: Analysis }) {
   const verdict = analysis.review_verdict
   const verdictText =
-    verdict === 'approve' ? 'Approved by the Reviewer Agent' : verdict === 'reject' ? 'Rejected by the Reviewer Agent' : verdict === 'revise' ? 'Changes requested by the Reviewer Agent' : null
+    verdict === 'approve' ? 'Approved in review' : verdict === 'reject' ? 'Rejected in review' : verdict === 'revise' ? 'Changes requested in review' : null
   return (
     <div className="space-y-4">
       {verdictText && (

@@ -31,6 +31,7 @@ export function friendlyAuthError(message: string): string {
   if (text.includes('already registered') || text.includes('already been registered')) return 'An account with this email already exists. Sign in instead.'
   if (text.includes('password should be')) return 'Use at least 8 characters for your password.'
   if (text.includes('same as the old password') || text.includes('should be different')) return 'Choose a password different from your current one.'
+  if (text.includes('email rate limit')) return 'Too many emails were sent recently. Please try again in an hour.'
   if (text.includes('rate limit') || text.includes('security purposes')) return 'Too many attempts. Wait a minute and try again.'
   if (text.includes('network') || text.includes('fetch')) return 'Cannot reach the sign-in service. Check your connection and try again.'
   return message

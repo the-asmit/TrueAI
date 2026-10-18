@@ -113,21 +113,6 @@ class PullRequestInfo(_Row):
     created_at: Optional[datetime] = None
 
 
-class PipelineStep(_Row):
-    id: UUID
-    step: str
-    kind: str
-    status: str
-    summary: Optional[str] = None
-    detail: Optional[Dict[str, Any]] = None
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    duration_ms: Optional[int] = None
-    input_tokens: Optional[int] = None
-    output_tokens: Optional[int] = None
-    created_at: datetime
-
-
 class IncidentDetail(IncidentSummary):
     sentry_event_id: Optional[str] = None
     sentry_issue_id: Optional[str] = None
@@ -136,13 +121,8 @@ class IncidentDetail(IncidentSummary):
     branch: Optional[str] = None
     pipeline_error: Optional[str] = None
     stack_trace: Optional[Any] = None
-    attempts: int = 0
-    started_at: Optional[datetime] = None
-    llm_input_tokens: Optional[int] = None
-    llm_output_tokens: Optional[int] = None
     analysis: Optional[Analysis] = None
     pull_request: Optional[PullRequestInfo] = None
-    steps: List[PipelineStep] = Field(default_factory=list)
 
 
 class IncidentUpdate(BaseModel):

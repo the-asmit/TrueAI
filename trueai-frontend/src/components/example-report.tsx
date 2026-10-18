@@ -21,12 +21,12 @@ export const EXAMPLE = {
   review: 'Supplies a default of “0” for the missing parameter, so int() never receives None; valid discounts behave exactly as before.',
   prTitle: 'Handle missing discount query parameter in order_total view',
   steps: [
-    { time: '18:52:04', who: 'Sentry event', what: 'TypeError with 1 application frame', tone: 'muted' },
-    { time: '18:52:07', who: 'Triage', what: 'Code bug · high severity', tone: 'ok' },
-    { time: '18:52:07', who: 'Source', what: 'Read shop/views.py at the deployed commit', tone: 'muted' },
-    { time: '18:52:09', who: 'Investigator', what: 'Root cause found · 96% confidence', tone: 'ok' },
-    { time: '18:52:11', who: 'Fix Engineer', what: '1 edit, risk low · patch applied and checked', tone: 'ok' },
-    { time: '18:52:13', who: 'Reviewer', what: 'Approved · 92% confidence', tone: 'ok' },
+    { time: '18:52:04', who: 'Error received', what: 'TypeError from Sentry', tone: 'muted' },
+    { time: '18:52:07', who: 'Classified', what: 'Code bug · high severity', tone: 'ok' },
+    { time: '18:52:07', who: 'Code read', what: 'shop/views.py at the deployed commit', tone: 'muted' },
+    { time: '18:52:09', who: 'Root cause', what: 'Found · 96% confidence', tone: 'ok' },
+    { time: '18:52:11', who: 'Fix written', what: '1 edit, risk low · checked', tone: 'ok' },
+    { time: '18:52:13', who: 'Reviewed', what: 'Approved · 92% confidence', tone: 'ok' },
     { time: '18:52:13', who: 'Pull request', what: 'Opened, waiting for your review', tone: 'review' },
   ],
   diff: [

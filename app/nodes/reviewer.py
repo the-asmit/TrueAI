@@ -36,7 +36,7 @@ async def reviewer_node(state: IncidentState) -> Dict[str, Any]:
     max_attempts = settings.MAX_FIX_ATTEMPTS
     patch = state.get("patch") or {}
     agent = ReviewerAgent()
-    await set_current_step(state, f"{agent.title} (attempt {attempt})")
+    await set_current_step(state, "Reviewing the fix")
 
     # The Reviewer sees the ORIGINAL code of every changed file.
     source_files = state.get("source_files") or {}
@@ -93,8 +93,8 @@ async def reviewer_node(state: IncidentState) -> Dict[str, Any]:
         return {**updates, "fix_feedback": list(state.get("fix_feedback") or []) + feedback, "patch": {}}
 
     reason = (
-        f"The Reviewer Agent rejected the proposed fix: {review['summary']}"
+        f"The proposed fix was rejected in review: {review['summary']}"
         if verdict == "reject"
-        else f"The Reviewer Agent still requested changes after {attempt} attempts: {review['summary']}"
+        else f"The review still requested changes after {attempt} attempts: {review['summary']}"
     )
     return {**updates, "action": "flag_for_review", "flag_reason": reason}

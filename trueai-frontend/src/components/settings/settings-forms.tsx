@@ -174,33 +174,12 @@ function KeyValue({ label, value }: { label: string; value: string }) {
   )
 }
 
-export function AgentModels({ agents, threshold }: { agents: Record<string, string>; threshold: number }) {
-  const order = ['triage', 'investigator', 'fix_engineer', 'reviewer', 'remediation']
-  const labels: Record<string, [string, string]> = {
-    triage: ['Triage', 'Classifies the incident and its severity'],
-    investigator: ['Investigator', 'Finds the root cause in your code'],
-    fix_engineer: ['Fix Engineer', 'Writes the smallest safe change'],
-    reviewer: ['Reviewer', 'Approves, requests changes or rejects'],
-    remediation: ['Remediation', 'Writes next steps when no PR is opened'],
-  }
+export function AutomaticPullRequests({ threshold }: { threshold: number }) {
   return (
-    <div className="space-y-3">
-      <ul className="divide-y divide-rule overflow-hidden rounded-lg border border-rule bg-sheet">
-        {order.map((name) => (
-          <li key={name} className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5">
-            <div>
-              <p className="text-sm font-medium text-ink">{labels[name][0]}</p>
-              <p className="text-[0.75rem] text-ink-3">{labels[name][1]}</p>
-            </div>
-            <span className="font-mono text-[0.8125rem] text-ink-2">{agents[name] ?? '—'}</span>
-          </li>
-        ))}
-      </ul>
-      <p className="max-w-[70ch] text-[0.75rem] text-ink-3">
-        Pull requests open automatically only at {Math.round(threshold * 100)}% root-cause and review confidence or higher. Models and thresholds are set by
-        whoever runs your TrueAI server (<code className="font-mono">AGENT_*</code> and <code className="font-mono">CONFIDENCE_*</code> settings).
-      </p>
-    </div>
+    <p className="max-w-[70ch] text-sm leading-relaxed text-ink-2">
+      TrueAI opens a pull request only when it is at least {Math.round(threshold * 100)}% confident in both the root cause and the fix, and the
+      change passes its safety checks. Everything else arrives as a diagnosis with next steps. Nothing is ever merged for you.
+    </p>
   )
 }
 

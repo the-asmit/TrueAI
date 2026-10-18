@@ -84,7 +84,7 @@ class BaseAgent(ABC, Generic[OutputT]):
                 output = self.parse(strip_reasoning(response.text))
             except AgentOutputError as exc:
                 if attempt == 2:
-                    raise AgentOutputError(f"{self.title} returned an unusable response: {exc}") from exc
+                    raise AgentOutputError(f"The AI model's reply could not be used: {exc}") from exc
                 logger.info("%s reply did not parse (%s) — asking it to correct the format.", self.title, exc)
                 hint = "Your reply was cut off because it was too long; be more concise. " if response.truncated else ""
                 messages += [

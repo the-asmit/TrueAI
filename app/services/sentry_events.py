@@ -25,7 +25,7 @@ import hashlib
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.security import scrub, scrub_headers, scrub_text, scrub_url
+from app.core.security import scrub, scrub_headers, scrub_text, scrub_url, without_nul
 
 MAX_FRAMES = 40
 MAX_BREADCRUMBS = 12
@@ -375,7 +375,7 @@ def _tags(event: Dict[str, Any]) -> Dict[str, str]:
     else:
         return result
     for key, value in list(items)[:30]:
-        key_str = str(key)[:64]
+        key_str = without_nul(str(key))[:64]
         if any(part in key_str.lower() for part in ("user", "email", "ip", "token", "session")):
             continue
         result[key_str] = scrub_text(str(value), max_len=200)
@@ -472,7 +472,7 @@ def _clean(value: Any) -> Optional[str]:
         return str(value)
     if not isinstance(value, str):
         return None
-    value = value.strip()
+    value = without_nul(value).strip()
     return value or None
 
 

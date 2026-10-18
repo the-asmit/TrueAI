@@ -41,7 +41,7 @@ async def decision_node(state: IncidentState) -> Dict[str, Any]:
 
     blockers: List[str] = []
     if review.get("verdict") != "approve":
-        blockers.append("the Reviewer did not approve the patch")
+        blockers.append("the review did not approve the patch")
     if float(review.get("confidence") or 0) < threshold:
         blockers.append(f"review confidence {float(review.get('confidence') or 0):.0%} is below the {threshold:.0%} auto-PR threshold")
     if float(investigation.get("confidence") or 0) < threshold:
@@ -49,7 +49,7 @@ async def decision_node(state: IncidentState) -> Dict[str, Any]:
             f"root-cause confidence {float(investigation.get('confidence') or 0):.0%} is below the {threshold:.0%} auto-PR threshold"
         )
     if fix.get("risk") == "high":
-        blockers.append("the Fix Engineer rated the change high-risk")
+        blockers.append("the change was rated high-risk")
     if state.get("policy_violations"):
         blockers.append("the patch violates TrueAI's safety policy")
     if not patch.get("files"):

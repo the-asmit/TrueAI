@@ -1,4 +1,4 @@
-import type { IncidentStatus, IssueClassification, Severity, StepStatus } from '@/lib/api/types'
+import type { IncidentStatus, IssueClassification, Severity } from '@/lib/api/types'
 
 /**
  * The single vocabulary for incident state. Every status has exactly one
@@ -9,7 +9,7 @@ export type Tone = 'fixed' | 'review' | 'human' | 'failure' | 'working' | 'muted
 
 export const STATUS: Record<IncidentStatus, { label: string; tone: Tone; description: string }> = {
   queued: { label: 'Queued', tone: 'working', description: 'Received from Sentry and waiting for an analysis worker.' },
-  processing: { label: 'Analysing', tone: 'working', description: 'The agents are working on this incident now.' },
+  processing: { label: 'Analysing', tone: 'working', description: 'TrueAI is working on this incident now.' },
   pr_open: { label: 'Pull request open', tone: 'review', description: 'A reviewed fix is waiting for your approval on GitHub.' },
   resolved: { label: 'Resolved', tone: 'fixed', description: 'The fix was merged, or someone marked the incident resolved.' },
   flagged: { label: 'Needs you', tone: 'human', description: 'TrueAI diagnosed it but a human must act; next steps are attached.' },
@@ -59,36 +59,6 @@ export const SEVERITY: Record<Severity, { label: string; rank: number }> = {
   high: { label: 'High', rank: 3 },
   medium: { label: 'Medium', rank: 2 },
   low: { label: 'Low', rank: 1 },
-}
-
-export const STEP_LABEL: Record<string, string> = {
-  parse: 'Read the Sentry event',
-  triage: 'Triage Agent',
-  context: 'Read the source',
-  investigator: 'Investigator Agent',
-  fix_engineer: 'Fix Engineer Agent',
-  patch: 'Applied and checked the patch',
-  reviewer: 'Reviewer Agent',
-  decision: 'Decision',
-  publish: 'Opened the pull request',
-  remediation: 'Remediation Agent',
-  complete: 'Outcome',
-}
-
-export const STEP_STATUS_TONE: Record<StepStatus, Tone> = {
-  running: 'working',
-  ok: 'fixed',
-  warning: 'human',
-  error: 'failure',
-  skipped: 'muted',
-}
-
-export const AGENT_LABEL: Record<string, string> = {
-  triage: 'Triage',
-  investigator: 'Investigator',
-  fix_engineer: 'Fix Engineer',
-  reviewer: 'Reviewer',
-  remediation: 'Remediation',
 }
 
 export function isActive(status: IncidentStatus) {

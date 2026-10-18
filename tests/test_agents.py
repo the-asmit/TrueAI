@@ -56,7 +56,7 @@ def test_agent_repairs_a_malformed_reply_once(scripted_llm):
 
 def test_agent_gives_up_after_the_repair_turn(scripted_llm):
     scripted_llm("nonsense", "still nonsense")
-    with pytest.raises(AgentOutputError, match="Triage Agent returned an unusable response"):
+    with pytest.raises(AgentOutputError, match="reply could not be used"):
         asyncio.run(TriageAgent().run(event=EVENT))
 
 

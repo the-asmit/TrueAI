@@ -46,22 +46,18 @@ def _unavailable(action: str) -> HTTPException:
 
 @router.get("/me", summary="Current user, onboarding and integration status")
 def get_me(user_id: str = Depends(require_jwt_user)) -> Dict[str, Any]:
-    from app.core.llm import configured_agents
-
     try:
-        profile = db.get_profile(user_id) or {}
-        github = db.get_github_row(user_id) or {}
-        default_repo = db.get_default_mapping(user_id) or {}
-        sentry = db.get_sentry_integration(user_id) or {}
-        active_keys = db.count_active_api_keys(user_id)
+        profile, github, default_repo, sentry, active_keys = db.gather(
+            lambda: db.get_profile(user_id) or {},
+            lambda: db.get_github_row(user_id) or {},
+            lambda: db.get_default_mapping(user_id) or {},
+            lambda: db.get_sentry_integration(user_id) or {},
+            lambda: db.count_active_api_keys(user_id),
+        )
     except DatabaseError:
         raise _unavailable("load your account")
 
     github_connected = bool(github.get("access_token"))
-    try:
-        agents = configured_agents()
-    except Exception:
-        agents = {}
     return {
         "user_id": user_id,
         "full_name": profile.get("full_name"),
@@ -76,7 +72,6 @@ def get_me(user_id: str = Depends(require_jwt_user)) -> Dict[str, Any]:
             "has_webhook_secret": bool(sentry.get("webhook_secret_enc")),
         },
         "onboarding_complete": bool(profile.get("full_name") and github_connected and default_repo and active_keys > 0),
-        "agents": agents,
         "auto_pr_threshold": settings.CONFIDENCE_AUTO_PR_THRESHOLD,
     }
 

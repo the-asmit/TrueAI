@@ -94,7 +94,7 @@ export default async function IntegrationsPage({ searchParams }: PageProps<'/int
             ) : (
               <div className="space-y-3">
                 <p className="max-w-[65ch] text-sm leading-relaxed text-ink-2">
-                  TrueAI asks for access to your repositories so the agents can read the code behind each error and open pull
+                  TrueAI asks for access to your repositories so it can read the code behind each error and open pull
                   requests. It never pushes to your branches directly and never merges.
                 </p>
                 <ConnectGitHubButton returnTo="/integrations" />

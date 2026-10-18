@@ -142,7 +142,7 @@ async def _initial_context(state: IncidentState) -> Dict[str, Any]:
 
 async def _fetch_requested(state: IncidentState) -> Dict[str, Any]:
     requested = list(state.get("pending_file_requests") or [])
-    await set_current_step(state, "Fetching files requested by the Investigator")
+    await set_current_step(state, "Reading more source code")
     started = time.perf_counter()
     try:
         update = await load_more_files(state, requested, reason="requested by Investigator")

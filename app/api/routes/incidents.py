@@ -5,7 +5,7 @@ Endpoints
 ─────────
 GET    /incidents                    paginated list (status / classification / search filters)
 GET    /incidents/stats              counts per status for the dashboard tabs
-GET    /incidents/{id}               full detail: incident + analysis + PR + agent timeline
+GET    /incidents/{id}               full detail: incident + analysis + PR
 PATCH  /incidents/{id}               user triage: resolved | ignored | flagged (reopen)
 POST   /incidents/{id}/reanalyze     run the agent pipeline again
 POST   /incidents/{id}/sync-pr       refresh the fix PR's status from GitHub now
@@ -40,7 +40,6 @@ from app.schemas.incident import (
     IncidentSummary,
     IncidentUpdate,
     IssueClassification,
-    PipelineStep,
     PullRequestInfo,
 )
 from app.services import redis as redis_svc
@@ -118,15 +117,15 @@ def incident_stats(user_id: str = Depends(require_current_user)) -> IncidentStat
 def get_incident(incident_id: UUID, user_id: str = Depends(require_current_user)) -> IncidentDetail:
     row = _load_incident(incident_id, user_id)
     try:
-        fix = db.get_latest_fix(str(incident_id))
-        pr = db.get_pull_request_for_incident(str(incident_id))
-        steps = db.list_steps(str(incident_id))
+        fix, pr = db.gather(
+            lambda: db.get_latest_fix(str(incident_id)),
+            lambda: db.get_pull_request_for_incident(str(incident_id)),
+        )
     except DatabaseError:
         raise _db_unavailable()
     detail = IncidentDetail.model_validate(row)
     detail.analysis = Analysis.model_validate(fix) if fix else None
     detail.pull_request = PullRequestInfo.model_validate(pr) if pr and _is_github_url(pr.get("pr_url")) else None
-    detail.steps = [PipelineStep.model_validate(step) for step in steps]
     return detail
 
 

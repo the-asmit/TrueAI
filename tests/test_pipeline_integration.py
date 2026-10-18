@@ -111,7 +111,7 @@ def test_fix_that_cannot_be_applied_is_retried_then_flagged_with_guidance(db, in
     assert _run(incident["id"])["status"] == "flagged"
     fix = db.get_latest_fix(incident["id"])
     assert fix["status"] == "not_applicable"
-    assert "could not produce a change that applies cleanly" in fix["flag_reason"]
+    assert "No change could be written that applies cleanly" in fix["flag_reason"]
     assert fix["remediation"]["steps"][0].startswith("Set DATABASE_URL")
 
 

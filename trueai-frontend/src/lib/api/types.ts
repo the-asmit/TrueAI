@@ -91,24 +91,6 @@ export interface PullRequestInfo {
   created_at: string | null
 }
 
-export type StepKind = 'agent' | 'tool' | 'system'
-export type StepStatus = 'running' | 'ok' | 'warning' | 'error' | 'skipped'
-
-export interface PipelineStep {
-  id: string
-  step: string
-  kind: StepKind
-  status: StepStatus
-  summary: string | null
-  detail: Record<string, unknown> | null
-  provider: string | null
-  model: string | null
-  duration_ms: number | null
-  input_tokens: number | null
-  output_tokens: number | null
-  created_at: string
-}
-
 export interface StackFrame {
   filename: string | null
   function: string | null
@@ -125,13 +107,8 @@ export interface IncidentDetail extends IncidentSummary {
   branch: string | null
   pipeline_error: string | null
   stack_trace: StackFrame[] | null
-  attempts: number
-  started_at: string | null
-  llm_input_tokens: number | null
-  llm_output_tokens: number | null
   analysis: Analysis | null
   pull_request: PullRequestInfo | null
-  steps: PipelineStep[]
 }
 
 export interface Me {
@@ -144,7 +121,6 @@ export interface Me {
   has_api_key: boolean
   sentry: { org_slug: string | null; has_auth_token: boolean; has_webhook_secret: boolean }
   onboarding_complete: boolean
-  agents: Record<string, string>
   auto_pr_threshold: number
 }
 

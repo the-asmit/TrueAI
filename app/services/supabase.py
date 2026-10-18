@@ -20,11 +20,14 @@ Design notes
 
 from __future__ import annotations
 
+import contextvars
 import threading
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from supabase import Client, create_client
+import httpx
+from supabase import Client, ClientOptions, create_client
 
 from app.core.config import settings
 from app.core.errors import DatabaseError
@@ -56,10 +59,7 @@ INCIDENT_LIST_COLUMNS = (
     "sentry_project,repo_full_name,branch,current_step,confidence,pipeline_error,"
     "created_at,updated_at,completed_at"
 )
-INCIDENT_DETAIL_COLUMNS = INCIDENT_LIST_COLUMNS + (
-    ",fingerprint,sentry_issue_id,sentry_issue_url,stack_trace,analysis_run,attempts,"
-    "started_at,llm_input_tokens,llm_output_tokens"
-)
+INCIDENT_DETAIL_COLUMNS = INCIDENT_LIST_COLUMNS + ",fingerprint,sentry_issue_id,sentry_issue_url,stack_trace"
 
 ACTIVE_INCIDENT_STATUSES = ("queued", "processing", "pr_open", "flagged")
 
@@ -75,8 +75,22 @@ def get_supabase() -> Client:
             _client = create_client(
                 settings.SUPABASE_URL,
                 settings.secret("SUPABASE_SERVICE_ROLE_KEY") or "",
+                options=ClientOptions(httpx_client=_http_client()),
             )
     return _client
+
+
+def _http_client() -> httpx.Client:
+    """
+    HTTP/1.1 with a connection pool.  The library's default is a single shared
+    HTTP/2 connection, which fails with "Server disconnected" when several
+    threads use it at once (concurrent API requests, parallel queries).
+    """
+    return httpx.Client(
+        http2=False,
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+    )
 
 
 def _run(description: str, fn):
@@ -92,6 +106,21 @@ def _run(description: str, fn):
 
 def _first(rows: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
+
+
+# Every query is a network round trip, so independent ones run side by side.
+_parallel = ThreadPoolExecutor(max_workers=16, thread_name_prefix="supabase")
+
+
+def gather(*queries: Callable[[], Any]) -> List[Any]:
+    """
+    Run independent queries concurrently and return their results in order.
+    The first failure (a DatabaseError) is raised once every query has finished.
+    Each query runs in a copy of the caller's context, so log lines keep their request id.
+    """
+    futures = [_parallel.submit(contextvars.copy_context().run, query) for query in queries]
+    wait(futures)
+    return [future.result() for future in futures]
 
 
 def utcnow() -> str:

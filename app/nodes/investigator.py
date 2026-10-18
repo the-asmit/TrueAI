@@ -34,7 +34,7 @@ async def investigator_node(state: IncidentState) -> Dict[str, Any]:
     round_number = int(state.get("investigation_rounds") or 0) + 1
     max_rounds = settings.MAX_INVESTIGATION_ROUNDS
     agent = InvestigatorAgent()
-    await set_current_step(state, f"{agent.title} (round {round_number})")
+    await set_current_step(state, "Finding the root cause")
 
     try:
         result = await agent.run(

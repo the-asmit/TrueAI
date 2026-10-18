@@ -555,9 +555,11 @@ end $$;
 -- Row Level Security
 --
 -- The API uses the service role (bypasses RLS) and filters by user itself.
--- These policies are the second line of defence for anything that reads
--- with a user's own JWT or the public anon key (the dashboard's Supabase
--- client).  Tables holding secrets get NO user policies at all.
+-- Users never read these tables directly: the dashboard reads everything
+-- through the TrueAI API, which returns only what a user should see (the
+-- internal run record, models and token usage stay server-side).  So RLS is
+-- on everywhere with NO user policies, and the browser-facing roles have no
+-- table privileges at all.
 -- ════════════════════════════════════════════════════════════════════════
 alter table public.user_profiles       enable row level security;
 alter table public.api_keys            enable row level security;
@@ -574,13 +576,12 @@ begin
   if to_regclass('public.profiles') is not null then
     execute 'alter table public.profiles enable row level security';
     execute 'drop policy if exists "profiles: read own" on public.profiles';
-    execute 'create policy "profiles: read own" on public.profiles for select to authenticated using (id = (select auth.uid()))';
   end if;
 end $$;
 
 -- v1 created FOR ALL policies for every role (reads AND writes through the
 -- public REST API, secrets tables included).  All v2 writes go through the
--- TrueAI API, so users get read-only access to their own non-secret rows.
+-- TrueAI API.
 drop policy if exists "users_own_profile"            on public.profiles;
 drop policy if exists "Users can manage own profile" on public.user_profiles;
 drop policy if exists "users_own_api_keys"           on public.api_keys;
@@ -591,7 +592,7 @@ drop policy if exists "users_own_pull_requests"      on public.pull_requests;
 drop policy if exists "user_profiles: insert own"    on public.user_profiles;
 drop policy if exists "user_profiles: update own"    on public.user_profiles;
 
--- Belt and braces: the browser-facing roles cannot write TrueAI tables at all.
+-- Belt and braces: the browser-facing roles cannot read or write TrueAI tables.
 do $$
 declare
   t text;
@@ -600,31 +601,18 @@ begin
                            'incidents', 'fixes', 'pull_requests', 'pipeline_steps']
   loop
     if to_regclass(format('public.%I', t)) is not null then
-      execute format('revoke insert, update, delete, truncate on public.%I from anon, authenticated', t);
+      execute format('revoke select, insert, update, delete, truncate on public.%I from anon, authenticated', t);
     end if;
   end loop;
 end $$;
 
-drop policy if exists "user_profiles: read own" on public.user_profiles;
-create policy "user_profiles: read own" on public.user_profiles for select to authenticated using (user_id = (select auth.uid()));
-
--- (select auth.uid()) is evaluated once per query instead of once per row.
-drop policy if exists "incidents: read own" on public.incidents;
-create policy "incidents: read own" on public.incidents for select to authenticated using (user_id = (select auth.uid()));
-
-drop policy if exists "repo_mappings: read own" on public.repo_mappings;
-create policy "repo_mappings: read own" on public.repo_mappings for select to authenticated using (user_id = (select auth.uid()));
-
+-- Earlier versions of this migration gave users read access to their own rows.
+drop policy if exists "user_profiles: read own"  on public.user_profiles;
+drop policy if exists "incidents: read own"      on public.incidents;
+drop policy if exists "repo_mappings: read own"  on public.repo_mappings;
 drop policy if exists "pipeline_steps: read own" on public.pipeline_steps;
-create policy "pipeline_steps: read own" on public.pipeline_steps for select to authenticated using (user_id = (select auth.uid()));
-
-drop policy if exists "fixes: read own" on public.fixes;
-create policy "fixes: read own" on public.fixes for select to authenticated
-  using (exists (select 1 from public.incidents i where i.id = fixes.incident_id and i.user_id = (select auth.uid())));
-
-drop policy if exists "pull_requests: read own" on public.pull_requests;
-create policy "pull_requests: read own" on public.pull_requests for select to authenticated
-  using (exists (select 1 from public.incidents i where i.id = pull_requests.incident_id and i.user_id = (select auth.uid())));
+drop policy if exists "fixes: read own"          on public.fixes;
+drop policy if exists "pull_requests: read own"  on public.pull_requests;
 
 -- v1 installs were told to add this; service_role bypasses RLS anyway.
 drop policy if exists "service_role_full_access_incidents" on public.incidents;

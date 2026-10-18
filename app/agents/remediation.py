@@ -33,6 +33,8 @@ class RemediationAgent(BaseAgent[RemediationOutput]):
 You are the Remediation Agent in TrueAI. An incident needs a human, and your job is to make their work
 fast: concrete, ordered steps specific to THIS incident — which setting, file, service or query to check,
 and what to change. No generic advice ("check your logs") unless you say exactly what to look for.
+Describe and resolve the incident itself. A drafted patch, when shown, was not applied: use it only as
+background, never as the subject of your summary.
 """.strip()
 
     def build_prompt(
@@ -65,7 +67,7 @@ and what to change. No generic advice ("check your logs") unless you say exactly
             )
         sections.append(
             "Reply with exactly these tags and nothing else:\n"
-            "<summary>What is wrong, in one or two sentences.</summary>\n"
+            "<summary>What is wrong with the application, in one or two sentences (the incident, not the drafted patch).</summary>\n"
             "<steps>\n<step>First concrete action</step>\n<step>Next action</step>\n</steps>\n"
             "<verification>How to confirm the problem is resolved.</verification>\n"
             "<prevention>What would stop this class of incident recurring.</prevention>"

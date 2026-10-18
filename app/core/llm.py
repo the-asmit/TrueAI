@@ -240,7 +240,7 @@ async def _invoke_with_retry(spec: ModelSpec, messages: List[BaseMessage]) -> LL
             last_error = exc
             retryable, wait_hint = _classify(exc)
             if not retryable:
-                raise LLMError(f"{spec.label} rejected the request: {_describe(exc)}", retryable=False) from exc
+                raise LLMError(f"The AI model rejected the request ({_describe(exc)})", retryable=False) from exc
             if attempt == attempts:
                 break
             delay = _backoff(attempt, wait_hint)
@@ -264,7 +264,7 @@ async def _invoke_with_retry(spec: ModelSpec, messages: List[BaseMessage]) -> LL
         )
 
     raise LLMError(
-        f"{spec.label} is unavailable after {attempts} attempts: {_describe(last_error)}", retryable=True
+        f"The AI model is unavailable right now ({_describe(last_error)})", retryable=True
     ) from last_error
 
 

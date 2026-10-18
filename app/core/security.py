@@ -50,8 +50,18 @@ def is_sensitive_key(key: str) -> bool:
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS)
 
 
+def without_nul(value: str) -> str:
+    """
+    Replace NUL characters with a visible ``\\x00``.  Postgres cannot store NUL
+    in text or jsonb, and errors caused by malformed input often carry one in
+    the request or message, so it is kept as readable evidence instead.
+    """
+    return value.replace("\x00", "\\x00")
+
+
 def scrub_text(value: str, *, max_len: int = 4000) -> str:
     """Remove credential/PII patterns from a free-text string and cap its length."""
+    value = without_nul(value)
     for pattern, replacement in _VALUE_PATTERNS:
         value = pattern.sub(replacement, value)
     if len(value) > max_len:
@@ -90,7 +100,7 @@ def scrub(value: Any, *, depth: int = 0, max_depth: int = 8, max_items: int = 50
             if index >= max_items:
                 out["…"] = f"{len(value) - max_items} more keys omitted"
                 break
-            key_str = str(key)
+            key_str = without_nul(str(key))
             out[key_str] = FILTERED if is_sensitive_key(key_str) else scrub(
                 item, depth=depth + 1, max_depth=max_depth, max_items=max_items, max_str=max_str
             )
@@ -121,7 +131,7 @@ def scrub_headers(headers: Any) -> dict[str, str]:
         return {}
     result: dict[str, str] = {}
     for key, value in pairs:
-        key_str = str(key)
+        key_str = without_nul(str(key))
         if is_sensitive_key(key_str) or key_str.lower() in {"x-forwarded-for", "x-real-ip", "forwarded"}:
             continue
         result[key_str] = scrub_text(str(value), max_len=300)

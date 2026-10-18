@@ -59,7 +59,7 @@ export function SetupSteps({ me }: { me: Me }) {
       >
         <div className="space-y-3">
           <p className="max-w-[60ch] text-[0.8125rem] leading-relaxed text-ink-2">
-            The agents read the code behind each error and open fixes as pull requests. TrueAI never pushes to your branches
+            TrueAI reads the code behind each error and opens fixes as pull requests. TrueAI never pushes to your branches
             and never merges.
           </p>
           <ConnectGitHubButton returnTo="/onboarding" label={me.github_connected ? 'Reconnect GitHub' : 'Connect GitHub'} />

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 from app.services.sentry_events import (
     compute_fingerprint,
@@ -84,6 +85,25 @@ def test_stored_payload_keeps_the_crash_site_of_a_long_stack():
     raw["exception"]["values"][0]["stacktrace"]["frames"] = deep
     event = normalize_event(payload_for_storage({"action": "created", "data": {"error": raw}}))
     assert event["frames"][-1]["function"] == "step_299"
+
+
+def test_nul_characters_never_reach_storage():
+    # Errors caused by malformed input carry NUL characters, which Postgres cannot store in text or jsonb.
+    raw = copy.deepcopy(RAW_EVENT)
+    raw["request"]["url"] = "https://shop.example.com/medicines?search=para\x00cetamol"
+    raw["request"]["query_string"] = [["search", "para\x00cetamol"]]
+    raw["request"]["headers"]["X-Odd\x00Header"] = "value\x00"
+    raw["tags"].append(["odd\x00tag", "x\x00y"])
+    raw["exception"]["values"][0]["stacktrace"]["frames"][1]["context_line"] = "    lookup('para\x00cetamol')"
+    raw["exception"]["values"][0]["stacktrace"]["frames"][1]["function"] = "get_\x00dashboard"
+
+    stored = payload_for_storage(raw)
+    event = normalize_event(stored)
+    for value in (stored, event):
+        assert "\x00" not in json.dumps(value, ensure_ascii=False)
+        assert "\\u0000" not in json.dumps(value)
+    # The evidence stays readable for the agents.
+    assert "para\\x00cetamol" in event["frames"][-1]["context_line"]
 
 
 def test_legacy_webhook_plugin_format_uses_issue_id_for_grouping():

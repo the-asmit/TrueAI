@@ -1,7 +1,7 @@
 import type { Metadata } from 'next'
 import type { ReactNode } from 'react'
 
-import { AgentModels, ApiKeys, DeleteAccount, KeyStatus, ProfileForm } from '@/components/settings/settings-forms'
+import { ApiKeys, AutomaticPullRequests, DeleteAccount, KeyStatus, ProfileForm } from '@/components/settings/settings-forms'
 import { ButtonLink } from '@/components/ui/button'
 import { Notice } from '@/components/ui/notice'
 import { api, toMessage } from '@/lib/api/client'
@@ -46,8 +46,8 @@ export default async function SettingsPage() {
             <ApiKeys keys={keys} />
           </SettingsSection>
 
-          <SettingsSection id="agents" title="Agents" description="The team that works on every incident, and the model each one runs on.">
-            <AgentModels agents={me.agents} threshold={me.auto_pr_threshold} />
+          <SettingsSection id="pull-requests" title="Automatic pull requests">
+            <AutomaticPullRequests threshold={me.auto_pr_threshold} />
           </SettingsSection>
 
           <SettingsSection id="danger" title="Danger zone">

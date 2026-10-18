@@ -247,7 +247,7 @@ function EmptyResult({ status, q, total, clearHref }: { status: IncidentStatus |
           </>
         }
       >
-        When Sentry reports an error through your webhook, it appears here within seconds and the agents start
+        When Sentry reports an error through your webhook, it appears here within seconds and TrueAI starts
         investigating. Nothing to do until then.
       </EmptyState>
     )
@@ -276,7 +276,7 @@ function SetupNotice({ me }: { me: Me }) {
       className="mt-6"
       action={<ButtonLink href="/onboarding" size="sm">Continue setup</ButtonLink>}
     >
-      {receiving && 'Incidents are being analysed, but the agents can’t read your code or open pull requests yet. '}
+      {receiving && 'Incidents are being analysed, but TrueAI can’t read your code or open pull requests yet. '}
       Still to do: {missing.join(', ')}.
     </Notice>
   )

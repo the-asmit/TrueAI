@@ -200,6 +200,21 @@ def test_webhook_rate_limit_per_key(client, user, monkeypatch):
 # Incidents                                                            #
 # ================================================================== #
 
+def test_users_cannot_read_tables_directly(client, user):
+    # A signed-in user's own token reaches nothing through the database's public API:
+    # what they see comes only from the TrueAI API (no run record, models or token usage).
+    import httpx
+
+    from tests.conftest import INTEGRATION_URL
+
+    key = _new_key(client, user)
+    client.post(f"/webhook/sentry?key={key['raw_key']}", json=_event())
+    rest_headers = {"Authorization": user["headers"]["Authorization"], "apikey": user_jwt(user["id"], role="anon")}
+    for table in ("pipeline_steps", "incidents", "fixes", "pull_requests", "api_keys", "github_tokens"):
+        response = httpx.get(f"{INTEGRATION_URL}/rest/v1/{table}?select=*", headers=rest_headers, timeout=10)
+        assert response.status_code in (401, 403), (table, response.status_code, response.text[:200])
+
+
 def test_tenants_cannot_see_each_others_incidents(client, user, make_user):
     key = _new_key(client, user)["raw_key"]
     incident_id = client.post(f"/webhook/sentry?key={key}", json=_event()).json()["incident_id"]
@@ -226,7 +241,9 @@ def test_list_filters_search_stats_and_detail(client, user, db):
     assert stats["by_status"] == {"queued": 1, "flagged": 1} and stats["total"] == 2
 
     detail = client.get(f"/incidents/{ids[0]}", headers=user["headers"]).json()
-    assert detail["status"] == "queued" and detail["analysis"] is None and detail["steps"] == []
+    assert detail["status"] == "queued" and detail["analysis"] is None
+    # The internal run record (timeline, models, token usage, attempts) is never sent to users.
+    assert not {"steps", "attempts", "llm_input_tokens", "llm_output_tokens", "started_at"} & set(detail)
     assert detail["created_at"].endswith("Z") or "+" in detail["created_at"]
     assert client.get(f"/incidents/{uuid.uuid4()}", headers=user["headers"]).status_code == 404
 
@@ -244,7 +261,7 @@ def test_triage_actions_and_reanalysis(client, user, db):
 
     response = client.post(f"/incidents/{incident_id}/reanalyze", headers=user["headers"])
     assert response.status_code == 200 and response.json() == {"status": "queued"}
-    row = db.get_incident(incident_id, user["id"])
+    row = db.get_incident(incident_id, user["id"], columns="status,analysis_run")
     assert row["status"] == "queued" and row["analysis_run"] == 2
     assert client.queued[-1] == incident_id  # type: ignore[attr-defined]
 
@@ -297,7 +314,7 @@ def test_github_oauth_binds_the_token_to_the_user_who_started_it(client, user, m
     row = db.get_github_row(user["id"])
     assert row["github_username"] == "alice" and not row["access_token"].startswith("gho_")  # encrypted at rest
     me = client.get("/auth/me", headers=user["headers"]).json()
-    assert me["github_connected"] is True and me["agents"]["fix_engineer"] == "groq:openai/gpt-oss-120b"
+    assert me["github_connected"] is True and "agents" not in me
 
 
 def test_account_deletion_removes_every_row(client, user, db, monkeypatch):

@@ -41,7 +41,7 @@ export default async function OnboardingPage({ searchParams }: PageProps<'/onboa
       <main id="main" className="mx-auto max-w-[720px] px-4 pb-20 pt-10 sm:px-8 sm:pt-14">
         <h1 className="text-[1.75rem] font-bold tracking-[-0.02em] text-ink">Set up TrueAI</h1>
         <p className="mt-2 max-w-[60ch] text-[0.9375rem] leading-relaxed text-ink-2">
-          Four steps. When they are done, every new error Sentry reports is investigated by the agents — and fixed with a pull
+          Four steps. When they are done, every new error Sentry reports is investigated by TrueAI and fixed with a pull
           request when it is safe to.
         </p>
 

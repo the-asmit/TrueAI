@@ -34,7 +34,7 @@ async def triage_node(state: IncidentState) -> Dict[str, Any]:
     incident_id = state.get("incident_id", "unknown")
     event = state.get("event") or {}
     agent = TriageAgent()
-    await set_current_step(state, agent.title)
+    await set_current_step(state, "Classifying the error")
 
     try:
         result = await agent.run(event=event)

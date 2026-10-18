@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 
 async def remediation_node(state: IncidentState) -> Dict[str, Any]:
     agent = RemediationAgent()
-    await set_current_step(state, agent.title)
+    await set_current_step(state, "Writing next steps")
     reason = state.get("flag_reason") or _default_reason(state)
     if state.get("repo_note") and state["repo_note"] not in reason:
         reason = f"{reason} {state['repo_note']}".strip()
@@ -61,7 +61,7 @@ async def remediation_node(state: IncidentState) -> Dict[str, Any]:
 def _default_reason(state: IncidentState) -> str:
     investigation = state.get("investigation") or {}
     if investigation and not investigation.get("code_fixable"):
-        return "The Investigator concluded this cannot be fixed with a code change in the repository."
+        return "The analysis concluded this cannot be fixed with a code change in the repository."
     if investigation:
         return f"Root-cause confidence ({float(investigation.get('confidence') or 0):.0%}) is too low for an automated fix."
     return "The incident needs human review."
