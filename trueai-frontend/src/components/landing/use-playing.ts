@@ -3,20 +3,28 @@
 import { useEffect, useState, type RefObject } from 'react'
 
 /**
- * True while the element is on screen and the visitor has not asked for reduced
- * motion. The landing page's looping illustrations only advance while this is true.
+ * Playback state for the landing page's looping illustrations.
+ *
+ *   playing        true while the element is on screen and motion is allowed;
+ *                  the illustration only advances while this is true
+ *   reducedMotion  the visitor asked for reduced motion: show the finished
+ *                  picture instead of playing it
  */
-export function usePlaying(ref: RefObject<HTMLElement | null>): boolean {
+export function usePlaying(ref: RefObject<HTMLElement | null>): { playing: boolean; reducedMotion: boolean } {
   const [playing, setPlaying] = useState(false)
+  const [reducedMotion, setReducedMotion] = useState(false)
 
   useEffect(() => {
     const node = ref.current
     if (!node) return
-    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)')
-    const observer = new IntersectionObserver(([entry]) => setPlaying(entry.isIntersecting && !reducedMotion.matches))
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const observer = new IntersectionObserver(([entry]) => {
+      setReducedMotion(query.matches)
+      setPlaying(entry.isIntersecting && !query.matches)
+    })
     observer.observe(node)
     return () => observer.disconnect()
   }, [ref])
 
-  return playing
+  return { playing, reducedMotion }
 }

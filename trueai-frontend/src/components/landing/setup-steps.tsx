@@ -16,7 +16,8 @@ import { usePlaying } from './use-playing'
  * rule above each step fills like a progress bar, then the sequence repeats.
  *
  * Like the hero's diagram it is ordinary elements and CSS transitions; it starts
- * finished, plays only while on screen, and stays finished under reduced motion.
+ * from the first step, plays only while on screen, and shows the finished picture under
+ * reduced motion.
  */
 
 // The moments of the sequence, in order, and how long each one is held (milliseconds).
@@ -45,15 +46,16 @@ type StepState = 'idle' | 'active' | 'done'
 
 export function SetupSteps() {
   const rootRef = useRef<HTMLOListElement>(null)
-  const playing = usePlaying(rootRef)
-  // Start finished, so the picture is complete before (and without) any motion.
-  const [moment, setMoment] = useState(FINISHED)
+  const { playing, reducedMotion } = usePlaying(rootRef)
+  // The sequence starts from the first step; reduced motion shows it finished.
+  const [playback, setMoment] = useState(CLEARED)
+  const moment = reducedMotion ? FINISHED : playback
 
   useEffect(() => {
     if (!playing) return
-    const timer = setTimeout(() => setMoment((current) => (current === FINISHED ? CLEARED : current + 1)), HOLD[moment])
+    const timer = setTimeout(() => setMoment((current) => (current === FINISHED ? CLEARED : current + 1)), HOLD[playback])
     return () => clearTimeout(timer)
-  }, [moment, playing])
+  }, [playback, playing])
 
   const panels = [<GitHubPanel key="github" moment={moment} />, <SentryPanel key="sentry" moment={moment} />, <FirstFixPanel key="fix" moment={moment} />]
 

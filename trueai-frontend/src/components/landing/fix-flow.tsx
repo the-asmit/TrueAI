@@ -16,7 +16,8 @@ import { usePlaying } from './use-playing'
  * incident plays.
  *
  * It is drawn with ordinary elements and CSS transitions (no canvas, no video).
- * It pauses while off-screen and shows one finished incident under reduced
+ * Every visitor sees it from the beginning. It pauses while off-screen and shows
+ * one finished incident under reduced
  * motion. The incidents illustrate the kinds of errors TrueAI handles.
  */
 
@@ -93,9 +94,10 @@ const HOLD = [350, 1000, 1500, 1500, 1100, 3400]
 
 export function FixFlow({ className }: { className?: string }) {
   const rootRef = useRef<HTMLDivElement>(null)
-  const playing = usePlaying(rootRef)
-  // Start on a finished incident, so the picture is complete before (and without) any motion.
-  const [scene, setScene] = useState({ incident: 0, step: DELIVERED })
+  const { playing, reducedMotion } = usePlaying(rootRef)
+  // Every visitor sees the first incident from its beginning; reduced motion shows it finished.
+  const [playback, setScene] = useState({ incident: 0, step: CLEARED })
+  const scene = reducedMotion ? { incident: 0, step: DELIVERED } : playback
 
   useEffect(() => {
     if (!playing) return
@@ -103,9 +105,9 @@ export function FixFlow({ className }: { className?: string }) {
       setScene(({ incident, step }) =>
         step === DELIVERED ? { incident: (incident + 1) % INCIDENTS.length, step: CLEARED } : { incident, step: step + 1 },
       )
-    }, HOLD[scene.step])
+    }, HOLD[playback.step])
     return () => clearTimeout(timer)
-  }, [scene, playing])
+  }, [playback, playing])
 
   const incident = INCIDENTS[scene.incident]
   const { step } = scene
