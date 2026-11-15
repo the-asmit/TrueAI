@@ -3,12 +3,14 @@ import type { Metadata } from 'next'
 import { RedactionExample } from '@/components/marketing/figures'
 import { breadcrumbs, JsonLd } from '@/components/marketing/json-ld'
 import { PageHero, Row, Rows, Section } from '@/components/marketing/page-parts'
+import { pageMetadata } from '@/lib/metadata'
 
-export const metadata: Metadata = {
-  title: 'Security and privacy',
+export const metadata: Metadata = pageMetadata({
+  title: { absolute: 'Security and privacy: what TrueAI can access' },
+  socialTitle: 'Security and privacy: what TrueAI can access',
   description:
     'What TrueAI can access on GitHub, what it stores, what it sends to the AI model, how private data is removed and the rules every fix must pass.',
-}
+})
 
 export default function SecurityPage() {
   return (

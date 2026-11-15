@@ -3,12 +3,14 @@ import Link from 'next/link'
 
 import { breadcrumbs, JsonLd } from '@/components/marketing/json-ld'
 import { PageHero, Row, Rows, Section } from '@/components/marketing/page-parts'
+import { pageMetadata } from '@/lib/metadata'
 
-export const metadata: Metadata = {
-  title: 'Docs: setup guide',
+export const metadata: Metadata = pageMetadata({
+  title: { absolute: 'TrueAI docs: connect Sentry and GitHub' },
+  socialTitle: 'TrueAI docs: connect Sentry and GitHub',
   description:
     'Set up TrueAI in minutes: connect GitHub, add your webhook URL to Sentry, then review incidents, manage connections and fix common setup problems.',
-}
+})
 
 const CONTENTS = [
   { href: '#quick-start', label: 'Quick start' },

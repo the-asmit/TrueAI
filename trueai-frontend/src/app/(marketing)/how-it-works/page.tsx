@@ -4,12 +4,14 @@ import Link from 'next/link'
 import { NextStepsExample, PullRequestPreview } from '@/components/marketing/figures'
 import { breadcrumbs, JsonLd } from '@/components/marketing/json-ld'
 import { PageHero, Row, Rows, Section } from '@/components/marketing/page-parts'
+import { pageMetadata } from '@/lib/metadata'
 
-export const metadata: Metadata = {
-  title: 'How it works',
+export const metadata: Metadata = pageMetadata({
+  title: { absolute: 'How TrueAI turns Sentry errors into pull requests' },
+  socialTitle: 'How TrueAI turns Sentry errors into pull requests',
   description:
     'How TrueAI turns a Sentry error into a reviewed GitHub pull request: reading your code, finding the root cause, checking the fix, and when it stops.',
-}
+})
 
 export default function HowItWorksPage() {
   return (

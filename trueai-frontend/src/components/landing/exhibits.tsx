@@ -69,7 +69,7 @@ export function AnswerExhibit() {
             <div className="min-w-0 flex-1 overflow-hidden rounded-lg border border-rule">
               <p className="border-b border-rule bg-sunken/70 px-3 py-1.5 font-mono text-[0.75rem] text-ink-2">shop/views.py</p>
               <div className="overflow-x-auto">
-                <table className="w-full border-collapse font-mono text-[0.75rem] leading-[1.8]">
+                <table aria-label="Proposed change to shop/views.py" className="w-full border-collapse font-mono text-[0.75rem] leading-[1.8]">
                   <tbody>
                     {DIFF.map((line, index) => (
                       <tr

@@ -147,11 +147,18 @@ export default async function LandingPage() {
   )
 }
 
-/** What search engines read about TrueAI: the product, who makes it, and the FAQ above. */
+/** What search engines read about TrueAI: the site, the product, who makes it, and the FAQ above. */
 function structuredData() {
   const description =
     'TrueAI reads each Sentry error, finds the root cause in your code and opens a reviewed fix as a GitHub pull request.'
   return [
+    {
+      '@context': 'https://schema.org',
+      // Google uses this to choose the site name shown in search results.
+      '@type': 'WebSite',
+      name: 'TrueAI',
+      url: APP_URL,
+    },
     {
       '@context': 'https://schema.org',
       // SoftwareSourceCode is what makes codeRepository a valid property here.

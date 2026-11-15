@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from 'next'
 import { JetBrains_Mono, Public_Sans } from 'next/font/google'
 import { cookies } from 'next/headers'
 
+import { OPEN_GRAPH_DEFAULTS, TWITTER_CARD } from '@/lib/metadata'
 import { APP_URL } from '@/lib/site'
 import './globals.css'
 
@@ -18,13 +19,13 @@ export const metadata: Metadata = {
     'TrueAI reads each Sentry error, finds the root cause in your code and opens a reviewed fix as a GitHub pull request. Nothing merges without you.',
   // './' resolves against each page's own path, so every page is its own canonical URL.
   alternates: { canonical: './' },
+  // The homepage's social preview; every other page sets its own through pageMetadata().
   openGraph: {
+    ...OPEN_GRAPH_DEFAULTS,
     title: 'TrueAI: AI that turns Sentry errors into GitHub pull requests',
     description: 'Every Sentry error becomes a reviewed fix, opened as a pull request. Nothing merges without you.',
-    type: 'website',
-    siteName: 'TrueAI',
   },
-  twitter: { card: 'summary_large_image' },
+  twitter: { card: TWITTER_CARD },
   robots: { index: true, follow: true },
 }
 
