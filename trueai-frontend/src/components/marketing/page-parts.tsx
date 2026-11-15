@@ -102,6 +102,17 @@ export function Row({ id, title, children }: { id?: string; title: ReactNode; ch
   )
 }
 
+/** Long-form text such as the legal pages: one readable column with H2 sections. */
+export function Prose({ children }: { children: ReactNode }) {
+  return (
+    <div className="mx-auto max-w-[1240px] px-4 py-16 sm:px-8 lg:py-20">
+      <div className="max-w-[70ch] space-y-4 text-[1.0625rem] leading-[1.7] text-ink-2 [&_a]:font-medium [&_a]:text-ink [&_a]:underline [&_a]:underline-offset-4 [&_code]:font-mono [&_code]:text-[0.875em] [&_code]:text-ink [&_h2]:mt-14 [&_h2]:scroll-mt-28 [&_h2]:text-[1.5rem] [&_h2]:font-bold [&_h2]:leading-tight [&_h2]:tracking-[-0.02em] [&_h2]:text-ink [&_h2:first-child]:mt-0 md:[&_h2]:scroll-mt-16 [&_li]:pl-1 [&_strong]:font-semibold [&_strong]:text-ink [&_ul]:list-disc [&_ul]:space-y-1.5 [&_ul]:pl-5">
+        {children}
+      </div>
+    </div>
+  )
+}
+
 const CONTROLS = [
   { title: 'Nothing merges without you.', panel: <MergePanel /> },
   { title: 'Every step is on the record.', panel: <RecordPanel /> },

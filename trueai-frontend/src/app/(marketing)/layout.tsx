@@ -45,7 +45,9 @@ export default async function MarketingLayout({ children }: { children: ReactNod
             <Wordmark className="text-ink-2" />
             <span>© {new Date().getFullYear()}</span>
           </div>
-          <nav aria-label="Contact" className="flex flex-wrap items-center gap-x-5 gap-y-2">
+          <nav aria-label="Footer" className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            <Link href="/privacy" className="hover:text-ink">Privacy</Link>
+            <Link href="/terms" className="hover:text-ink">Terms</Link>
             <a href={REPO_URL} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1.5 hover:text-ink">
               <Star className="size-3.5" aria-hidden /> Star on GitHub
             </a>

@@ -10,5 +10,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { url: `${APP_URL}/security`, changeFrequency: 'monthly', priority: 0.8 },
     { url: `${APP_URL}/docs`, changeFrequency: 'monthly', priority: 0.8 },
     { url: `${APP_URL}/signup`, changeFrequency: 'yearly', priority: 0.6 },
+    { url: `${APP_URL}/privacy`, changeFrequency: 'yearly', priority: 0.3 },
+    { url: `${APP_URL}/terms`, changeFrequency: 'yearly', priority: 0.3 },
   ]
 }
