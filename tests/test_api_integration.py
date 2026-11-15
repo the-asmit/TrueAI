@@ -317,16 +317,50 @@ def test_github_oauth_binds_the_token_to_the_user_who_started_it(client, user, m
     assert me["github_connected"] is True and "agents" not in me
 
 
+def _connect_github(db, user_id: str, token: str = "gho_example_token_for_tests") -> None:
+    from app.services.crypto import encrypt_secret
+
+    db.upsert_github_row({"user_id": user_id, "access_token": encrypt_secret(token), "github_username": "alice"})
+
+
 def test_account_deletion_removes_every_row(client, user, db, monkeypatch):
     from app.services import supabase
+    from app.services.github import client as github_client
 
     key = _new_key(client, user)["raw_key"]
     client.post(f"/webhook/sentry?key={key}", json=_event())
     client.post("/auth/profile", json={"full_name": "Alice"}, headers=user["headers"])
+    _connect_github(db, user["id"])
 
+    revoked_tokens: list[str] = []
+    monkeypatch.setattr(github_client, "revoke_oauth_grant", lambda token: revoked_tokens.append(token) or True)
     deleted_auth_users: list[str] = []
     monkeypatch.setattr(supabase, "delete_auth_user", lambda uid: deleted_auth_users.append(uid))
     assert client.delete("/auth/account", headers=user["headers"]).status_code == 204
+    # Like "Disconnect GitHub", deletion revokes the authorisation with the decrypted token.
+    assert revoked_tokens == ["gho_example_token_for_tests"]
     assert deleted_auth_users == [user["id"]]
     assert db.list_incidents(user["id"], page=1, page_size=10)[1] == 0
     assert db.list_api_keys(user["id"]) == [] and db.get_profile(user["id"]) is None
+    assert db.get_github_row(user["id"]) is None
+
+
+@pytest.mark.parametrize("failure", ["refused", "crashed"])
+def test_account_deletion_survives_a_failed_github_revoke(client, user, db, monkeypatch, caplog, failure):
+    from app.services import supabase
+    from app.services.github import client as github_client
+
+    def _revoke(token: str) -> bool:
+        if failure == "crashed":
+            raise RuntimeError("GitHub unreachable")
+        return False  # GitHub answered, but didn't confirm the revoke
+
+    _connect_github(db, user["id"])
+    monkeypatch.setattr(github_client, "revoke_oauth_grant", _revoke)
+    monkeypatch.setattr(supabase, "delete_auth_user", lambda uid: None)
+
+    with caplog.at_level("WARNING"):
+        assert client.delete("/auth/account", headers=user["headers"]).status_code == 204
+    # The account is still deleted, and the failure is on record.
+    assert db.get_github_row(user["id"]) is None and db.get_profile(user["id"]) is None
+    assert any("revoking the authorisation" in r.message or "revoke the GitHub authorisation" in r.message for r in caplog.records)

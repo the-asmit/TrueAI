@@ -198,7 +198,10 @@ def revoke_oauth_grant(access_token: str) -> bool:
             headers={"Accept": "application/vnd.github+json"},
             timeout=10.0,
         )
-        return response.status_code in (204, 404)
+        if response.status_code in (204, 404):
+            return True
+        logger.warning("revoke_oauth_grant: GitHub answered HTTP %s", response.status_code)
+        return False
     except httpx.HTTPError as exc:
         logger.warning("revoke_oauth_grant failed: %s", type(exc).__name__)
         return False

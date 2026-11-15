@@ -140,7 +140,8 @@ export default function PrivacyPage() {
           <li>Your account, connections and incidents are kept while your account is open.</li>
           <li>You can delete any incident and its report from the dashboard at any time.</li>
           <li>
-            Deleting your account removes your account and everything that belongs to it: incidents, reports, connections, settings and keys.
+            Deleting your account removes your account and everything that belongs to it: incidents, reports, connections, settings and keys. It
+            also revokes TrueAI’s authorisation at GitHub.
           </li>
           <li>Short-lived technical data, such as rate-limit entries and cached file lists, expires on its own.</li>
           <li>
@@ -159,8 +160,9 @@ export default function PrivacyPage() {
         <ul>
           <li>See everything we hold about your incidents and connections in your dashboard.</li>
           <li>
-            Disconnect GitHub under Integrations: this revokes TrueAI’s authorisation at GitHub and deletes the stored token. You can also remove
-            TrueAI under your GitHub account’s settings, in Applications.
+            Disconnect GitHub under Integrations: this revokes TrueAI’s authorisation at GitHub and deletes the stored token. Deleting your account
+            does the same. If GitHub can’t be reached at that moment, your account is still deleted; you can then remove TrueAI yourself under your
+            GitHub account’s settings, in Applications.
           </li>
           <li>Revoke webhook keys under Settings.</li>
           <li>Delete your account, and everything that belongs to it, under Settings, in the Danger zone.</li>

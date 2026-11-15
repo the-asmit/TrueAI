@@ -90,17 +90,33 @@ def delete_account(
     user_id: str = Depends(require_jwt_user),
     _limit: None = Depends(user_rate_limit("delete-account", 5, 3600)),
 ) -> None:
-    from app.services.github.client import load_connection, revoke_oauth_grant
-
     try:
-        connection = load_connection(user_id)
-        if connection:
-            revoke_oauth_grant(connection.token)
+        _revoke_github_authorisation(user_id)
         db.delete_user_data(user_id)
         db.delete_auth_user(user_id)
     except DatabaseError:
         raise _unavailable("delete your account")
     logger.info("delete_account: account deleted | user_id=%s", user_id)
+
+
+def _revoke_github_authorisation(user_id: str) -> None:
+    """
+    Revoke TrueAI's authorisation at GitHub, as "Disconnect GitHub" does, before
+    the stored token is deleted with the account.  GitHub can't stop an account
+    deletion: any failure is logged and the deletion continues.  Database errors
+    still propagate, since the deletion itself would fail on them anyway.
+    """
+    from app.services.github.client import load_connection, revoke_oauth_grant
+
+    try:
+        connection = load_connection(user_id)
+        if connection is None or revoke_oauth_grant(connection.token):
+            return
+        logger.warning("delete_account: GitHub did not confirm revoking the authorisation | user_id=%s", user_id)
+    except DatabaseError:
+        raise
+    except Exception as exc:
+        logger.warning("delete_account: could not revoke the GitHub authorisation | user_id=%s | error=%s", user_id, type(exc).__name__)
 
 
 # ================================================================== #

@@ -240,7 +240,7 @@ export default function DocsPage() {
           <Row title="Deleting your account">
             <p>
               <strong>Settings → Danger zone → Delete account</strong> removes your account and everything that belongs to it: incidents, reports,
-              connections and keys. Pull requests already opened stay on GitHub.
+              connections and keys, and revokes TrueAI’s authorisation at GitHub. Pull requests already opened stay on GitHub.
             </p>
           </Row>
         </Rows>
