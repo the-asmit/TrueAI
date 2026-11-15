@@ -1,23 +1,25 @@
 import type { Metadata, Viewport } from 'next'
 import { JetBrains_Mono, Public_Sans } from 'next/font/google'
 import { cookies } from 'next/headers'
+
+import { APP_URL } from '@/lib/site'
 import './globals.css'
 
 const publicSans = Public_Sans({ variable: '--font-public-sans', subsets: ['latin'], display: 'swap' })
 const jetbrainsMono = JetBrains_Mono({ variable: '--font-jetbrains-mono', subsets: ['latin'], display: 'swap' })
 
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
-
 export const metadata: Metadata = {
   metadataBase: new URL(APP_URL),
   title: {
-    default: 'TrueAI: stop debugging, start merging',
+    default: 'TrueAI: AI that turns Sentry errors into GitHub pull requests',
     template: '%s · TrueAI',
   },
   description:
-    'TrueAI reads every Sentry error, finds the root cause in your code and opens a reviewed fix as a GitHub pull request, usually within a minute. When code is not the answer, you get the exact next steps.',
+    'TrueAI reads each Sentry error, finds the root cause in your code and opens a reviewed fix as a GitHub pull request. Nothing merges without you.',
+  // './' resolves against each page's own path, so every page is its own canonical URL.
+  alternates: { canonical: './' },
   openGraph: {
-    title: 'TrueAI: stop debugging, start merging',
+    title: 'TrueAI: AI that turns Sentry errors into GitHub pull requests',
     description: 'Every Sentry error becomes a reviewed fix, opened as a pull request. Nothing merges without you.',
     type: 'website',
     siteName: 'TrueAI',
